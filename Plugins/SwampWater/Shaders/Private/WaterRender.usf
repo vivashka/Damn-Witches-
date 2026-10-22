@@ -1,0 +1,940 @@
+// Отрисовка воды (перенос SwampWater.shader / WaterShading.hlsl / WaterWhitewater.shader из Unity).
+// Рисуется перед постобработкой поверх готовой сцены: поверхность — сетка по столбцам симуляции (вершина в центре
+// столбца), цвет — мутность по глубине, преломление, отражение неба, блик солнца; белая вода — шары и купола пены.
+// Координаты симуляции — метры, y вверх; мир UE — см, Z вверх: мир = (x, z, y)·100. Позиции — в translated world
+// (относительно камеры), так точность не зависит от размера мира.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ReflectionEnvironmentShared.ush"
+#include "/Engine/Private/SkyAtmosphereCommon.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "/Plugin/SwampWater/Private/WaterBubbles.ush"
+
+// ---------------------------------------------------------------- общее
+
+Texture2D<float4> SimSurface;      // x — уровень, y — глубина (−1 = сухо), zw — скорость
+Texture2D<float4> SimSurfacePrev;  // прошлый шаг: отрисовка плавно переходит от него к последнему
+float SimBlend;
+float4 SimParams;                  // origin.x, origin.z, cell, N
+float3 WorldOriginTranslated;      // translated world точки (0, 0, 0) мира
+
+float3 SimToTranslated(float3 p) { return WorldOriginTranslated + float3(p.x, p.z, p.y) * 100.0; }
+float3 TranslatedToSim(float3 t) { float3 w = (t - WorldOriginTranslated) * 0.01; return float3(w.x, w.z, w.y); }
+float3 DirToSim(float3 d) { return float3(d.x, d.z, d.y); }
+float3 DirToWorld(float3 d) { return float3(d.x, d.z, d.y); }
+
+// Поверхность столбца c между двумя последними шагами (у сухого в одном из них — последняя).
+float4 SurfaceAt(int2 c)
+{
+	float4 s = SimSurface.Load(int3(c, 0));
+	float4 p = SimSurfacePrev.Load(int3(c, 0));
+	return s.y >= 0 && p.y >= 0 ? lerp(p, s, SimBlend) : s;
+}
+
+// Уровень в точке xz — билинейно между центрами столбцов, как его рисует сетка поверхности. false — сухо.
+bool SimLevel(float2 xz, out float level)
+{
+	float2 g = (xz - SimParams.xy) / SimParams.z - 0.5;
+	int2 b = (int2)floor(g);
+	float2 f = g - b;
+	int last = (int)SimParams.w - 1;
+	float4 s00 = SurfaceAt(clamp(b, 0, last)), s10 = SurfaceAt(clamp(b + int2(1, 0), 0, last));
+	float4 s01 = SurfaceAt(clamp(b + int2(0, 1), 0, last)), s11 = SurfaceAt(clamp(b + int2(1, 1), 0, last));
+	level = lerp(lerp(s00.x, s10.x, f.x), lerp(s01.x, s11.x, f.x), f.y);
+	return s00.y >= 0 || s10.y >= 0 || s01.y >= 0 || s11.y >= 0;
+}
+
+float3 SunDirectionSim() { return DirToSim(View.DirectionalLightDirection); } // к солнцу (в UE это поле уже к солнцу)
+float3 SunColor() { return View.DirectionalLightColor.rgb * View.PreExposure; }
+float3 SkyColor(float3 dirSim) { return GetSkySHDiffuse(DirToWorld(dirSim)) * View.PreExposure; }
+
+// ---------------------------------------------------------------- копия глубины сцены
+
+Texture2D SceneDepthIn;
+
+void FullscreenVS(uint VertexId : SV_VertexID, out float4 Position : SV_POSITION)
+{
+	float2 uv = float2((VertexId << 1) & 2, VertexId & 2);
+	Position = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+
+void DepthCopyPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	OutColor = SceneDepthIn.Load(int3(SvPosition.xy, 0)).r;
+}
+
+// ---------------------------------------------------------------- поверхность
+
+Texture2D SceneColorCopy;
+SamplerState SceneColorSampler;
+Texture2D<float> SceneDepthCopy;
+Texture2D<float> BubbleDist;   // м: расстояние от глаза до ближайшего пузыря под водой (1e6 — нет)
+float WaterTime;
+
+// Оптика болотной воды по каналам RGB (~610/550/465 нм), 1/м — SwampWaterOptics (SwampWaterRendering.h): те же
+// числа нужны и игровому потоку (адаптация глаза под водой).
+float3 Absorption;
+float Scattering;
+float Backscatter;
+// Шероховатость поверхности для Френеля: плёнка, пыльца, микрорябь стоячей воды.
+static const float SurfaceRoughness = 0.25;
+static const float WaterIOR = 1.333;
+
+float ShoreFade;
+float SimEdgeFade;
+float NormalStrength;
+float RippleScale;
+float RippleSpeed;
+float2 WindDir;
+float DetailFadeDistance;
+float RefractionStrength;
+float Smoothness;
+float ReflectionStrength;
+float SpecularStrength;
+int SSRSteps;          // шагов луча отражения по экрану (0 — без отражений сцены, только небо)
+float SSRMaxDistance;  // см
+Texture2D PlanarReflection;          // сцена из зеркальной камеры под водой (без предэкспозиции)
+SamplerState PlanarSampler;
+float4x4 PlanarTranslatedToClip;     // translated world кадра → клип зеркальной камеры
+float PlanarValid;                   // 0 — снимка нет: небо и отражение по экрану
+int PlanarDebug;                     // отладка: 1 — вода показывает только снимок отражения
+
+
+struct FSurfaceVaryings
+{
+	float4 Position : SV_POSITION;
+	float3 Sim : TEXCOORD0;       // точка поверхности в координатах симуляции
+	float3 SimNormal : TEXCOORD1;
+	float SimDepth : TEXCOORD2;
+};
+
+// Вершины поверхности — раз за кадр на столбец (уровень между шагами, нормаль, глубина), и список мокрых плиток
+// для отрисовки: рисуются только плитки 8×8 квадратов, где хоть один угол мокрый.
+RWTexture2D<float4> VertexDataOut;   // x — уровень, yz — нормаль xz, w — глубина (−1 — сухо)
+RWStructuredBuffer<uint> WetTilesOut;
+RWBuffer<uint> DrawArgsOut;          // (вершин на плитку, плиток, 0, 0)
+Texture2D<float4> VertexData;
+StructuredBuffer<uint> WetTiles;
+groupshared uint GWet;
+
+[numthreads(8, 8, 1)]
+void SurfaceVertsCS(uint3 Group : SV_GroupID, uint3 Thread : SV_GroupThreadID, uint GI : SV_GroupIndex)
+{
+	int n = (int)SimParams.w, last = n - 1;
+	int2 c = (int2)(Group.xy * 8 + Thread.xy);
+	if (GI == 0) GWet = 0;
+	GroupMemoryBarrierWithGroupSync();
+	float4 s = SurfaceAt(c);
+	float4 r = SurfaceAt(clamp(c + int2(1, 0), 0, last));
+	float4 t = SurfaceAt(clamp(c + int2(0, 1), 0, last));
+	// Нормаль из уклона поверхности — Собель с шагом NormalStride столбцов. Уровень по столбцам шумит на сантиметры
+	// (частица — 1/8 ячейки высоты), а уклон по соседним столбцам усиливает шум в углы, которые солнечный блик
+	// различает: он ходит по квадратам сетки. Шаг в несколько столбцов (опора ±(Stride+1)) гасит шум размером
+	// с ячейку и оставляет волны длиннее ~1 м; мельче сетка всё равно не держит, это — рябь. Сухих соседей не
+	// учитываем (берём уровень этого столбца), чтобы не ломать кромку.
+	static const int NormalStride = 3;
+	float e[3][3];
+	[unroll] for (int j = 0; j < 3; j++)
+	[unroll] for (int i = 0; i < 3; i++)
+	{
+		float4 o = SurfaceAt(clamp(c + int2(i - 1, j - 1) * NormalStride, 0, last));
+		e[j][i] = o.y < 0 ? s.x : o.x;
+	}
+	float gx = (e[0][0] + 2 * e[1][0] + e[2][0]) - (e[0][2] + 2 * e[1][2] + e[2][2]);
+	float gz = (e[0][0] + 2 * e[0][1] + e[0][2]) - (e[2][0] + 2 * e[2][1] + e[2][2]);
+	float inv = 1.0 / (8.0 * NormalStride * SimParams.z); // сумма весов столбца 4 × расстояние между краями 2·Stride
+	float3 nrm = normalize(float3(gx * inv, 1.0, gz * inv));
+	VertexDataOut[c] = float4(s.x, nrm.x, nrm.z, s.y);
+	// Квадраты плитки берут ещё столбцы +1 по x и z.
+	float4 d = SurfaceAt(clamp(c + int2(1, 1), 0, last));
+	if (max(max(s.y, r.y), max(t.y, d.y)) >= 0) GWet = 1;
+	GroupMemoryBarrierWithGroupSync();
+	if (GI == 0 && GWet != 0)
+	{
+		uint slot;
+		InterlockedAdd(DrawArgsOut[1], 1u, slot);
+		WetTilesOut[slot] = Group.y * (uint)(n / 8) + Group.x;
+	}
+}
+
+void SurfaceVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FSurfaceVaryings O)
+{
+	static const int2 Corners[6] = { int2(0, 0), int2(0, 1), int2(1, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+	int n = (int)SimParams.w;
+	uint tile = WetTiles[InstanceId];
+	uint tilesPerRow = (uint)(n / 8);
+	uint quad = VertexId / 6;
+	int2 q = int2(tile % tilesPerRow, tile / tilesPerRow) * 8 + int2(quad & 7u, quad >> 3);
+	O = (FSurfaceVaryings)0;
+	O.Position = float4(2, 2, 2, 1);
+	if (q.x >= n - 1 || q.y >= n - 1) return;
+	// Сухой квадрат целиком — отбросить (все вершины в одной точке вне экрана).
+	float da = VertexData.Load(int3(q, 0)).w, db = VertexData.Load(int3(q + int2(1, 0), 0)).w;
+	float dd = VertexData.Load(int3(q + int2(0, 1), 0)).w, de = VertexData.Load(int3(q + int2(1, 1), 0)).w;
+	if (max(max(da, db), max(dd, de)) < 0) return;
+	int2 c = q + Corners[VertexId % 6];
+	float4 v = VertexData.Load(int3(c, 0));
+	float3 p = float3(SimParams.x + (c.x + 0.5) * SimParams.z, v.x, SimParams.y + (c.y + 0.5) * SimParams.z);
+	O.SimNormal = float3(v.y, sqrt(saturate(1.0 - v.y * v.y - v.z * v.z)), v.z);
+	O.SimDepth = max(v.w, 0.0);
+	O.Sim = p;
+	O.Position = mul(float4(SimToTranslated(p), 1), View.TranslatedWorldToClip);
+}
+
+float2 Hash22(float2 p)
+{
+	p = float2(dot(p, float2(127.1, 311.7)), dot(p, float2(269.5, 183.3)));
+	return -1.0 + 2.0 * frac(sin(p) * 43758.5453);
+}
+
+// Градиентный шум со значением и производными (x — значение, yz — d/dx, d/dy): одна выборка вместо четырёх для нормали.
+float3 GradientNoiseD(float2 p)
+{
+	float2 i = floor(p);
+	float2 f = frac(p);
+	// Квинтика (Perlin improved): у неё нулевые первая и вторая производные на границах ячеек. С кубической
+	// 3f²−2f³ вторая производная разрывна, и нормаль ряби (она — производная шума) ломается по границам квадратов
+	// шума; блик солнца проявляет эти изломы сеткой.
+	float2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+	float2 du = 30.0 * f * f * (f - 1.0) * (f - 1.0);
+	float2 ga = Hash22(i), gb = Hash22(i + float2(1, 0)), gc = Hash22(i + float2(0, 1)), gd = Hash22(i + float2(1, 1));
+	float va = dot(ga, f), vb = dot(gb, f - float2(1, 0)), vc = dot(gc, f - float2(0, 1)), vd = dot(gd, f - float2(1, 1));
+	float value = va + u.x * (vb - va) + u.y * (vc - va) + u.x * u.y * (va - vb - vc + vd);
+	float2 deriv = ga + u.x * (gb - ga) + u.y * (gc - ga) + u.x * u.y * (ga - gb - gc + gd)
+		+ du * (u.yx * (va - vb - vc + vd) + float2(vb, vc) - va);
+	return float3(value, deriv);
+}
+
+// Октава шума, у которой ячейка меньше ~6 пикселей, гаснет: иначе вдали нормаль мерцает (алиасинг).
+// footprint — размер пикселя на воде, м; freq — ячеек на метр.
+float OctaveFade(float footprint, float freq) { return saturate(2.0 - 12.0 * footprint * freq); }
+
+// Рябь: три октавы, нормаль из аналитических производных (d/dp = d/dq · масштаб).
+float3 RippleNormal(float2 p, float strength, float footprint)
+{
+	float t = WaterTime * RippleSpeed;
+	float2 w = normalize(WindDir + 1e-4);
+	float2 q = p * RippleScale;
+	float2 grad = GradientNoiseD(q + w * t).yz * OctaveFade(footprint, RippleScale);
+	grad += GradientNoiseD(q * 2.3 - w.yx * t * 1.4 + 17.3).yz * (0.5 * 2.3) * OctaveFade(footprint, RippleScale * 2.3);
+	grad += GradientNoiseD(q * 5.1 + w * t * 2.1 + 41.7).yz * (0.25 * 5.1) * OctaveFade(footprint, RippleScale * 5.1);
+	grad *= RippleScale;
+	return normalize(float3(-grad.x * strength, 1.0, -grad.y * strength));
+}
+
+// Небо в направлении (сим): атмосфера из Sky View LUT (как у материалов неба), без атмосферы — SH небесного света.
+float3 SkyReflection(float3 dirSim)
+{
+	float3 dirW = DirToWorld(dirSim);
+	dirW.z = max(dirW.z, 0.01); // вниз от воды отражается горизонт, а не земля планеты
+	dirW = normalize(dirW);
+	float3x3 referential = GetSkyViewLutReferential(View.SkyViewLutReferential);
+	float viewHeight = View.SkyPlanetTranslatedWorldCenterAndViewHeight.w * CM_TO_SKY_UNIT;
+	float3 dirLocal = mul(referential, dirW);
+	float2 sol = RayIntersectSphere(float3(0, 0, viewHeight), dirLocal, float4(0, 0, 0, View.SkyAtmosphereBottomRadiusKm));
+	float2 uv;
+	SkyViewLutParamsToUv(any(sol > 0.0), dirLocal.z, dirLocal, viewHeight, View.SkyAtmosphereBottomRadiusKm, View.SkyViewLutSizeAndInvSize, uv);
+	float3 sky = Texture2DSampleLevel(View.SkyViewLutTexture, View.SkyViewLutTextureSampler, uv, 0).rgb * View.SkyAtmosphereSkyLuminanceFactor.rgb;
+	return dot(sky, 1) > 0 ? sky : SkyColor(dirSim);
+}
+
+// Плоское отражение по отражённому лучу R (сим): пиксель зеркальной камеры, который смотрит в направлении R. Для ровной
+// воды на уровне зеркала луч из точки воды по R проходит через зеркальный глаз — это тот же пиксель, что у проекции
+// самой точки. Точку волны на δ выше зеркала её проекция уводила на ~2δ/d (d — до точки воды): у глаза в 10 см над
+// водой сантиметровые волны сдвигали выборку больше всей полосы отражения, ступеньками по ячейкам симуляции. По
+// направлению ошибка — только параллакс 2δ/(до отражённого), а рябь искажает отражение через саму нормаль.
+float3 PlanarReflectionColor(float3 R)
+{
+	// Луч, ушедший вниз (рябь у скользящего взгляда), почти сразу падает на соседнюю волну под скользящим углом — там
+	// Френель ~1, и он отражается ещё раз, от средней плоскости воды.
+	float3 dirW = DirToWorld(float3(R.x, max(abs(R.y), 1e-4), R.z));
+	float4 clip = mul(float4(dirW, 0), PlanarTranslatedToClip);
+	if (clip.w <= 1e-4) return SkyReflection(R); // за зеркальной камерой
+	float2 uv = clamp(clip.xy / clip.w * float2(0.5, -0.5) + 0.5, 0.0005, 0.9995);
+	return PlanarReflection.SampleLevel(PlanarSampler, uv, 0).rgb * View.PreExposure;
+}
+
+// Отражение сцены по экрану: луч из точки воды шагами (чаще у начала) по копии глубины, попадание уточняется
+// делением пополам. a — доверие (0 — луч ушёл за экран, к камере или в небо: там остаётся небо).
+float3 ScreenReflection(float3 posSim, float3 dirSim, float2 pixel, out float a)
+{
+	a = 0;
+	if (SSRSteps <= 0) return 0;
+	float3 start = SimToTranslated(posSim);
+	float3 dir = DirToWorld(dirSim);
+	float jitter = frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715)) + 0.618034 * (View.StateFrameIndexMod8)));
+	float prevT = 0;
+	for (int i = 1; i <= SSRSteps; i++)
+	{
+		float f = (i - 1 + jitter) / SSRSteps;
+		float t = SSRMaxDistance * f * f + 5.0;
+		float4 clip = mul(float4(start + dir * t, 1), View.TranslatedWorldToClip);
+		if (clip.w <= 1.0) return 0;
+		float2 uv = clip.xy / clip.w * float2(0.5, -0.5) + 0.5;
+		if (any(uv <= 0.0) || any(uv >= 1.0)) return 0; // за экраном сцены нет
+		float2 px = View.ViewRectMin.xy + uv * View.ViewSizeAndInvSize.xy;
+		float diff = clip.w - ConvertFromDeviceZ(SceneDepthCopy.Load(int3(px, 0)));
+		if (diff > 0)
+		{
+			if (diff > max(60.0, (t - prevT) * 1.5)) return 0; // за предметом, не на нём
+			float lo = prevT, hi = t;
+			for (int b = 0; b < 4; b++)
+			{
+				float m = 0.5 * (lo + hi);
+				float4 c = mul(float4(start + dir * m, 1), View.TranslatedWorldToClip);
+				float2 u = c.xy / c.w * float2(0.5, -0.5) + 0.5;
+				float d = c.w - ConvertFromDeviceZ(SceneDepthCopy.Load(int3(View.ViewRectMin.xy + u * View.ViewSizeAndInvSize.xy, 0)));
+				if (d > 0) { hi = m; uv = u; } else lo = m;
+			}
+			// Плавно гаснет к краям экрана (за ними — небо), чтобы не было резкой границы.
+			float edge = min(min(uv.x, 1.0 - uv.x) * 5.0, min(uv.y * 12.0, (1.0 - uv.y) * 8.0));
+			a = smoothstep(0.0, 1.0, saturate(edge)) * saturate(4.0 * (1.0 - hi / SSRMaxDistance));
+			px = View.ViewRectMin.xy + uv * View.ViewSizeAndInvSize.xy;
+			return SceneColorCopy.SampleLevel(SceneColorSampler, px * View.BufferSizeAndInvSize.zw, 0).rgb;
+		}
+		prevT = t;
+	}
+	return 0;
+}
+
+// Точка сцены под пикселем (по копии глубины), в координатах симуляции.
+float3 SceneSimPosition(float2 pixel)
+{
+	float deviceZ = SceneDepthCopy.Load(int3(pixel, 0));
+	return TranslatedToSim(SvPositionToTranslatedWorld(float4(pixel, deviceZ, 1)));
+}
+
+// Рассеяние взвесью: Хеньи–Гринстейн с сильным пиком вперёд (ил и детрит, g ≈ 0.92, Mobley «Light and Water») плюс
+// изотропная доля 2·bb/b — она даёт обратное рассеяние bb (у HG с таким g его почти нет).
+static const float ParticleG = 0.92;
+float PhaseHG(float cosT, float g)
+{
+	float d = 1.0 + g * g - 2.0 * g * cosT;
+	return (1.0 - g * g) / (4.0 * PI * d * sqrt(d));
+}
+float WaterPhase(float cosT, float g)
+{
+	float w = saturate(2.0 * Backscatter / Scattering);
+	return (1.0 - w) * PhaseHG(cosT, g) + w / (4.0 * PI);
+}
+
+// ---------------------------------------------------------------- свет в воде
+// Под поверхностью свет двух видов. Прямой луч солнца (преломлён по Снеллиусу) теряет всё, что поглощено или рассеяно:
+// гаснет как exp(−c·z/cosθw) и бросает тени (объём видимости — WaterSun.usf). Рассеянный — небо и уже рассеянное
+// солнце: весь нисходящий поток гаснет медленнее, по Kd (Kirk 1984, 1991: Kd = √(a² + G·a·b)/μ0, G = 0.425·μ0 − 0.19),
+// рассеянная часть — разность, она без резких теней и приходит в основном сверху. Проверка: Kd по Гордону (1989,
+// Монте-Карло: Kd ≈ 1.04·(a + bb)/μ0) расходится с этим на ~15%. Облучённости здесь — плоские и в
+// единицах E/π (яркость белого ламберта), отсюда π у яркости рассеяния.
+Texture3D<float> SunVis;          // 1 — прямой луч доходит, 0 — тень
+SamplerState SunVisSampler;
+float3 SunVisOrigin;              // м, угол объёма
+float3 SunVisExtent;              // м (0 — объёма нет)
+float3 ToSunSim;
+int SunVisDebug;                  // отладка: поверхность показывает видимость солнца (1) или ил (2) под собой
+TextureCube WindowCube;           // надводный мир с поверхности над глазом (без предэкспозиции)
+SamplerState WindowSampler;
+float WindowValid;
+
+static const float MuDiffuse = 0.75; // средний косинус нисходящего рассеянного света в мутной воде (Kirk)
+static const float MuUp = 0.4;       // средний косинус восходящего потока (Kirk 1994: ~0.35–0.45)
+
+float SunVisibility(float3 p)
+{
+	if (SunVisExtent.x <= 0) return 1.0;
+	float3 uvw = (p - SunVisOrigin) / SunVisExtent;
+	if (any(uvw < 0) || any(uvw > 1)) return 1.0;
+	return SunVis.SampleLevel(SunVisSampler, uvw, 0);
+}
+
+// ---- спектр: 8 полос по 40 нм (420…700). Цвета сцены (RGB) переводятся в спектр гладким неотрицательным базисом
+// и обратно — функциями сложения цветов CIE 1931 под D65 (SpectralToRGB·RGBToSpectral = единичная). Покомпонентное
+// ослабление в трёх широких каналах ошибается там, где поглощение по каналу сильно меняется (гумус: синий канал
+// «гаснет» целиком, хотя 480–500 нм ещё проходят); в спектре пропускание пути — матрица 3×3, а не множитель.
+float4 SpecAbsorption[2];         // 1/м: вода (Pope & Fry 1997) + гумус + детрит
+float4 SpecSedimentAbsorption[2]; // м²/г — детрит ила
+float4 SpectralToRGB[6];          // 3 строки × 8 полос
+float4 RGBToSpectral[6];          // 3 столбца (r, g, b) × 8 полос
+
+struct FSpec { float4 l, h; };
+FSpec SpecC(float v) { FSpec r; r.l = v; r.h = v; return r; }
+FSpec SpecAdd(FSpec a, FSpec b) { FSpec r; r.l = a.l + b.l; r.h = a.h + b.h; return r; }
+FSpec SpecSub(FSpec a, FSpec b) { FSpec r; r.l = a.l - b.l; r.h = a.h - b.h; return r; }
+FSpec SpecMul(FSpec a, FSpec b) { FSpec r; r.l = a.l * b.l; r.h = a.h * b.h; return r; }
+FSpec SpecDiv(FSpec a, FSpec b) { FSpec r; r.l = a.l / b.l; r.h = a.h / b.h; return r; }
+FSpec SpecScale(FSpec a, float k) { FSpec r; r.l = a.l * k; r.h = a.h * k; return r; }
+FSpec SpecExp(FSpec a) { FSpec r; r.l = exp(a.l); r.h = exp(a.h); return r; }
+FSpec SpecSqrt(FSpec a) { FSpec r; r.l = sqrt(max(a.l, 0)); r.h = sqrt(max(a.h, 0)); return r; }
+FSpec SpecMax0(FSpec a) { FSpec r; r.l = max(a.l, 0); r.h = max(a.h, 0); return r; }
+FSpec SpecLoad(float4 v[2]) { FSpec r; r.l = v[0]; r.h = v[1]; return r; }
+FSpec SpecFromRGB(float3 c)
+{
+	FSpec r;
+	r.l = c.r * RGBToSpectral[0] + c.g * RGBToSpectral[2] + c.b * RGBToSpectral[4];
+	r.h = c.r * RGBToSpectral[1] + c.g * RGBToSpectral[3] + c.b * RGBToSpectral[5];
+	return r;
+}
+float3 SpecToRGB(FSpec a)
+{
+	return float3(dot(SpectralToRGB[0], a.l) + dot(SpectralToRGB[1], a.h),
+		dot(SpectralToRGB[2], a.l) + dot(SpectralToRGB[3], a.h),
+		dot(SpectralToRGB[4], a.l) + dot(SpectralToRGB[5], a.h));
+}
+// Цвет за слоем с пропусканием t(λ): RGB → спектр → ·t → RGB (матрица 3×3 на цвет).
+float3 SpecTransmit(FSpec t, float3 c) { return SpecToRGB(SpecMul(t, SpecFromRGB(c))); }
+
+struct FWaterLight
+{
+	float3 s;      // куда идёт прямой луч в воде
+	float cosW;
+	FSpec Sun0;    // прямой луч под поверхностью, плоская облучённость (E/π)
+	FSpec Sky0;    // небо под поверхностью
+	FSpec Kd;      // весь нисходящий поток
+	FSpec a;       // поглощение
+	FSpec c;       // ослабление луча
+};
+
+FWaterLight GetWaterLight()
+{
+	FWaterLight W;
+	float3 L = SunDirectionSim();
+	float cosA = saturate(L.y);
+	W.s = cosA > 0 ? refract(-L, float3(0, 1, 0), 1.0 / WaterIOR) : float3(0, -1, 0);
+	W.cosW = max(-W.s.y, 0.05);
+	float T = 1.0 - (0.02 + 0.98 * pow(1.0 - cosA, 5.0));
+	// Цвет направленного света в UE — освещённость E (ламберт: яркость = альбедо·E/π); небо (SH) — уже E/π.
+	W.Sun0 = SpecFromRGB(SunColor() * T * cosA / PI);
+	W.Sky0 = SpecFromRGB(SkyColor(float3(0, 1, 0)) * 0.93);
+	W.a = SpecLoad(SpecAbsorption);
+	W.c = SpecAdd(W.a, SpecC(Scattering));
+	float G = 0.425 * W.cosW - 0.19;
+	W.Kd = SpecScale(SpecSqrt(SpecAdd(SpecMul(W.a, W.a), SpecScale(W.a, G * Scattering))), 1.0 / W.cosW);
+	return W;
+}
+FSpec DirectPlanar(FWaterLight W, float z) { return SpecMul(W.Sun0, SpecExp(SpecScale(W.c, -max(z, 0) / W.cosW))); }
+FSpec TotalPlanar(FWaterLight W, float z) { return SpecMul(SpecAdd(W.Sun0, W.Sky0), SpecExp(SpecScale(W.Kd, -max(z, 0)))); }
+FSpec ReflectanceInf(FWaterLight W) { return SpecDiv(SpecC(0.33 * Backscatter), W.a); } // R ≈ 0.33·bb/a (Морель, Приёр 1977)
+
+// Ил со дна (WaterSediment.usf), г/м³: добавляет рассеяние и бурое поглощение по своей концентрации.
+Texture3D<float> Sediment;
+float3 SedimentOrigin;
+float3 SedimentExtent;            // м (0 — нет)
+float SedimentScattering;         // м²/г
+
+float SedimentAt(float3 p)
+{
+	if (SedimentExtent.x <= 0) return 0;
+	float3 uvw = (p - SedimentOrigin) / SedimentExtent;
+	if (any(uvw < 0) || any(uvw > 1)) return 0;
+	return Sediment.SampleLevel(SunVisSampler, uvw, 0);
+}
+
+// Своя яркость толщи на отрезке луча от p0 по d длиной len (однократное рассеяние обоих видов света) и пропускание
+// отрезка (спектр). Марш по отрезку: тени прямого луча вдоль пути (лучи света в толще), меняющаяся с глубиной доля
+// рассеянного и облака ила (свои b и a в каждой точке). Точки — по равным долям ослабления чистой толщи.
+float3 WaterPath(float3 p0, float level, float3 d, float len, out FSpec trans)
+{
+	FWaterLight W = GetWaterLight();
+	// 6 точек по равным долям ослабления: интеграл гладкий (экспоненты), с 10 точками разница < 1%.
+	const int Steps = 6;
+	float cr = min(min(W.c.h.x, W.c.h.y), min(W.c.h.z, W.c.h.w)); // самое прозрачное — красное
+	float far = 1.0 - exp(-cr * len);
+	float pSun = WaterPhase(dot(W.s, -d), ParticleG);
+	// Рассеянный свет идёт сверху широким конусом (средний косинус MuDiffuse). Свёртка Хеньи–Гринстейна с ним — снова
+	// Хеньи–Гринстейн с g = g·MuDiffuse (коэффициенты Лежандра перемножаются). Сверху вода так отражает Lu/Ed ≈ 0.7%,
+	// как по Морелю и Приёру (1977: R ≈ 0.33·bb/a, Q ≈ π); с g = 0.5 было вдвое светлее.
+	float pSky = WaterPhase(d.y, ParticleG * MuDiffuse);
+	// Многократное рассеяние в двухпотоковом приближении: кроме нисходящего, есть восходящий поток Eu = R·Ed (рассеянное
+	// назад толщей и дном), он шире и идёт снизу; его однократное рассеяние к глазу.
+	float pUp = WaterPhase(-d.y, ParticleG * MuUp);
+	FSpec Rinf = ReflectanceInf(W);
+	FSpec sedA = SpecLoad(SpecSedimentAbsorption);
+	FSpec result = SpecC(0);
+	trans = SpecC(1);
+	float prevt = 0;
+	for (int i = 1; i <= Steps; i++)
+	{
+		float t = i == Steps ? len : min(-log(max(1.0 - far * i / Steps, 1e-6)) / cr, len);
+		float dt = t - prevt;
+		float3 q = p0 + d * (prevt + 0.5 * dt);
+		float z = level - q.y;
+		float sed = SedimentAt(q);
+		float b = Scattering + SedimentScattering * sed;
+		FSpec c = SpecAdd(W.c, SpecAdd(SpecScale(sedA, sed), SpecC(SedimentScattering * sed)));
+		FSpec direct = DirectPlanar(W, z);
+		FSpec total = TotalPlanar(W, z);
+		FSpec diffuse = SpecMax0(SpecSub(total, direct));
+		FSpec src = SpecScale(SpecAdd(SpecAdd(SpecScale(direct, pSun / W.cosW * SunVisibility(q)), SpecScale(diffuse, pSky / MuDiffuse)),
+			SpecScale(SpecMul(Rinf, total), pUp / MuUp)), PI * b);
+		FSpec segT = SpecExp(SpecScale(c, -dt));
+		result = SpecAdd(result, SpecDiv(SpecMul(SpecMul(src, trans), SpecSub(SpecC(1), segT)), c));
+		trans = SpecMul(trans, segT);
+		prevt = t;
+	}
+	return SpecToRGB(result);
+}
+float3 WaterPathRadiance(float3 p0, float level, float3 d, float len)
+{
+	FSpec t;
+	return WaterPath(p0, level, d, len, t);
+}
+
+// Освещение предмета под водой по G-буферу (движок осветил его солнцем «из воздуха» — направление, тени и сила там
+// неверны): прямой луч по преломлённому направлению с тенью, рассеянный — сверху, снизу — отражённый толщей (R∞).
+// Только диффузное: блик под водой гасит шероховатость и рассеяние. false — свет предмета свой (неосвещаемый).
+bool RelightUnderwater(float2 pixel, float3 p, float level, out float3 color)
+{
+	FGBufferData G = GetGBufferData(pixel * View.BufferSizeAndInvSize.zw);
+	color = 0;
+	if (G.ShadingModelID == SHADINGMODELID_UNLIT) return false;
+	FWaterLight W = GetWaterLight();
+	float3 n = normalize(DirToSim(G.WorldNormal));
+	float z = level - p.y;
+	FSpec direct = DirectPlanar(W, z);
+	FSpec total = TotalPlanar(W, z);
+	FSpec diffuse = SpecMax0(SpecSub(total, direct));
+	float vis = SunVisibility(p + n * 0.1);
+	FSpec E = SpecAdd(SpecScale(direct, saturate(dot(n, -W.s)) * vis / W.cosW),
+		SpecScale(SpecAdd(SpecScale(diffuse, saturate(0.5 + 0.5 * n.y)), SpecScale(SpecMul(total, ReflectanceInf(W)), saturate(0.5 - 0.5 * n.y))), G.GBufferAO));
+	color = SpecToRGB(SpecMul(SpecFromRGB(G.DiffuseColor), E));
+	return true;
+}
+
+// Свет у точки воды относительно света над водой, по RGB (пузыри: ShadeSphere множит им солнце и небо).
+float3 WaterLightRatio(float3 p, float level)
+{
+	FWaterLight W = GetWaterLight();
+	float z = level - p.y;
+	FSpec direct = DirectPlanar(W, z);
+	FSpec here = SpecAdd(SpecScale(direct, SunVisibility(p)), SpecMax0(SpecSub(TotalPlanar(W, z), direct)));
+	return SpecToRGB(here) / max(SpecToRGB(SpecAdd(W.Sun0, W.Sky0)), 1e-4);
+}
+
+// Луч пикселя начинается в воде: его начало — точка на ближней плоскости, а не глаз. Глаз у самой поверхности видит
+// кадр, разделённый линией воды (ближняя плоскость её пересекает); по одному глазу кадр целиком переключался, а
+// ближние к глазу треугольники воды срезала ближняя плоскость — там было чистое дно.
+bool RayUnderwater(float2 pixel, out float3 origin, out float level)
+{
+#if HAS_INVERTED_Z_BUFFER
+	const float NearDeviceZ = 1.0;
+#else
+	const float NearDeviceZ = 0.0;
+#endif
+	origin = TranslatedToSim(SvPositionToTranslatedWorld(float4(pixel, NearDeviceZ, 1)));
+	return SimLevel(origin.xz, level) && origin.y < level;
+}
+
+// Путь света от точки p к началу луча под водой: толща гасит его (c = a + b на метр) и добавляет свою яркость.
+float3 UnderwaterFog(float3 origin, float level, float3 p, float3 color)
+{
+	float len = distance(origin, p);
+	FSpec T;
+	float3 L = WaterPath(origin, level, (p - origin) / max(len, 1e-4), len, T);
+	return SpecTransmit(T, color) + L;
+}
+
+// Под водой — вся сцена сквозь толщу до глаза (кроме того, что за поверхностью: его рисует SurfacePS снизу).
+void UnderwaterPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 pixel = SvPosition.xy;
+	float3 origin;
+	float level;
+	if (!RayUnderwater(pixel, origin, level)) { clip(-1); OutColor = 0; return; }
+	// Направление — по лучу пикселя: у неба глубина бесконечна, и точка сцены по ней — не число.
+	float3 dir = normalize(DirToSim(SvPositionToTranslatedWorld(float4(pixel, 0.5, 1))));
+	float deviceZ = SceneDepthCopy.Load(int3(pixel, 0));
+	// Тело игрока (First Person Rendering) нарисовано сжатым к глазу, чтобы не проходить сквозь стены: по глубине оно
+	// у самого глаза и муть его не трогала. Его место на деле — обратным преобразованием вида.
+	float3 sceneT = SvPositionToTranslatedWorld(float4(pixel, deviceZ, 1));
+	if (IsFirstPerson(GetGBufferData(pixel * View.BufferSizeAndInvSize.zw)))
+		sceneT = mul(sceneT, (float3x3)View.InvFirstPersonTransform);
+	float3 scenePos = TranslatedToSim(sceneT);
+	float dist = deviceZ > 0 ? distance(origin, scenePos) : 1e6;
+	float bubble = BubbleDist.Load(int3(pixel, 0));
+	float3 color = SceneColorCopy.Load(int3(pixel, 0)).rgb;
+	// Предмет под водой освещается заново светом воды (RelightUnderwater). Пузыри (BubblePS) освещены им уже.
+	float sceneLevel;
+	if (deviceZ > 0 && bubble >= dist && SimLevel(scenePos.xz, sceneLevel) && scenePos.y < sceneLevel)
+	{
+		float3 relit;
+		if (RelightUnderwater(pixel, scenePos, sceneLevel, relit)) color = relit;
+	}
+	dist = min(dist, bubble);
+	if (dir.y > 1e-4) dist = min(dist, (level - origin.y) / dir.y); // луч выходит из воды
+	OutColor = float4(UnderwaterFog(origin, level, origin + dir * dist, color), 1);
+}
+
+void SurfacePS(FSurfaceVaryings I, out float4 OutColor : SV_Target0)
+{
+	float3 pos = I.Sim;
+	float3 cam = TranslatedToSim(float3(0, 0, 0)); // камера — начало translated world
+	float3 V = normalize(cam - pos);
+	float camDist = distance(cam, pos);
+	float2 pixel = I.Position.xy;
+
+	// Глубина без преломления — для кромки берега.
+	float3 scene0 = SceneSimPosition(pixel);
+	float depth0 = pos.y - scene0.y;
+
+	float footprint = max(length(ddx(pos.xz)), length(ddy(pos.xz)));
+	float detail = saturate(1.0 - camDist / DetailFadeDistance);
+	float3 ripple = RippleNormal(pos.xz, NormalStrength * detail, footprint);
+	float3 simN = normalize(I.SimNormal);
+	float3 N = normalize(float3(simN.x + ripple.x, simN.y, simN.z + ripple.z));
+
+	// Преломление: сдвиг по нормали, но не берём то, что выше воды.
+	float2 bufferSize = View.BufferSizeAndInvSize.xy;
+	float2 refrPixel = pixel + N.xz * RefractionStrength * saturate(depth0) * bufferSize;
+	refrPixel = clamp(refrPixel, View.ViewRectMin.xy + 0.5, View.ViewRectMin.xy + View.ViewSizeAndInvSize.xy - 0.5);
+	float3 scene = SceneSimPosition(refrPixel);
+	if (scene.y > pos.y)
+	{
+		refrPixel = pixel;
+		scene = scene0;
+	}
+
+	// Пузыри под водой (проход WhitePass 0) — ближе дна на этом луче: толща воды — до них. Пузырь ближе самой
+	// поверхности (глаз под водой) поверхностью не закрывается.
+	float bubble = BubbleDist.Load(int3(refrPixel, 0));
+	float sceneDist = distance(cam, scene);
+	if (bubble < sceneDist && sceneDist < 1e5) scene = cam + (scene - cam) * (bubble / max(sceneDist, 1e-4));
+	if (BubbleDist.Load(int3(pixel, 0)) < camDist) { clip(-1); OutColor = 0; return; } // уже в сцене (UnderwaterPS)
+
+	// Поверхность снизу: из воды в воздух свет выходит только внутри окна Снеллиуса (sin θ < 1/1.33); вне его — полное
+	// внутреннее отражение, видна толща. Внутри — надводный мир по Френелю, и всё гаснет по пути до глаза.
+	float3 rayOrigin;
+	float rayLevel;
+	if (RayUnderwater(pixel, rayOrigin, rayLevel))
+	{
+		float3 Nd = -N;
+		float cosI = saturate(dot(V, Nd));
+		float sin2T = WaterIOR * WaterIOR * (1.0 - cosI * cosI);
+		// Полное внутреннее отражение показывает толщу под поверхностью — её яркость по отражённому лучу.
+		float3 body = WaterPathRadiance(pos, pos.y, reflect(-V, Nd), 10.0);
+		float3 seen = body;
+		if (sin2T < 1.0)
+		{
+			float cosT = sqrt(1.0 - sin2T);
+			float F = 0.02 + 0.98 * pow(1.0 - cosT, 5.0);
+			// Надводный мир — по преломлённому лучу (из воды в воздух, n = 1.333): весь он сжат в конус окна ~97°.
+			// Что на этом луче — по буферу глубины (как у отражения), за экраном — небо в этом направлении.
+			float3 airDir = refract(-V, Nd, WaterIOR);
+			float hit;
+			float3 onScreen = ScreenReflection(pos, airDir, pixel, hit);
+			float3 offScreen = WindowValid > 0 ? WindowCube.SampleLevel(WindowSampler, DirToWorld(airDir), 0).rgb * View.PreExposure
+				: SkyReflection(airDir);
+			float3 above = lerp(offScreen, onScreen, hit);
+			seen = lerp(above, body, F);
+		}
+		OutColor = float4(UnderwaterFog(rayOrigin, rayLevel, pos, seen), 1);
+		return;
+	}
+
+	float viewDist = distance(scene, pos);
+	float vDepth = max(pos.y - scene.y, 0.0);
+	float3 sceneColor = SceneColorCopy.SampleLevel(SceneColorSampler, refrPixel * View.BufferSizeAndInvSize.zw, 0).rgb;
+
+	float3 L = SunDirectionSim();
+	float3 sun = SunColor();
+	float3 ambient = SkyColor(float3(0, 1, 0));
+
+	// Толща воды — однородная среда. Свет дна сначала спускается к нему (ослабление ≈ Kd = a + bb на метр глубины),
+	// потом идёт к глазу по лучу (ослабление c = a + b). Вместо потерянного луч набирает свет, рассеянный самой водой.
+	// Дно освещено светом воды на своей глубине (RelightUnderwater), пузырь — уже им; к глазу — ослабление по пути.
+	float3 bottom = sceneColor;
+	if (bubble >= sceneDist && vDepth > 0)
+	{
+		float3 relit;
+		if (RelightUnderwater(refrPixel, scene, pos.y, relit)) bottom = relit;
+	}
+	// Своя яркость толщи — по преломлённому лучу взгляда (WaterPathRadiance, та же модель, что под водой).
+	float3 refrDir = refract(-V, N, 1.0 / WaterIOR);
+	if (dot(refrDir, refrDir) < 1e-6) refrDir = float3(0, -1, 0);
+	FSpec viewT;
+	float3 inscatter = WaterPath(pos, pos.y, normalize(refrDir), viewDist, viewT);
+	float3 water = SpecTransmit(viewT, bottom) + inscatter;
+	if (SunVisDebug == 1) { OutColor = float4(SunVisibility(pos + normalize(refrDir) * 0.25).xxx * View.PreExposure * 2.0, 1); return; }
+	if (SunVisDebug == 2)
+	{
+		// Ил: наибольшая концентрация в столбе под поверхностью, белое — 100 мг/л.
+		float sedMax = 0;
+		for (int k = 0; k < 24; k++) sedMax = max(sedMax, SedimentAt(pos - float3(0, 0.05 + 0.1 * k, 0)));
+		OutColor = float4(float3(saturate(sedMax / 100.0), saturate(sedMax / 20.0), 0) * View.PreExposure * 2.0, 1);
+		return;
+	}
+
+	// Отражение по Френелю (F0 воды 0.02). Плёнка и микрорябь на стоячей воде делают поверхность шероховатой:
+	// у скользящих углов она отражает не всё (Френель с шероховатостью, Lagarde), поэтому вдали вода не зеркало.
+	float3 R = reflect(-V, N);
+	float3 reflection;
+	if (PlanarValid > 0.0)
+	{
+		reflection = PlanarReflectionColor(R);
+	}
+	else
+	{
+		float hit;
+		float3 sceneReflection = ScreenReflection(pos, R, pixel, hit);
+		reflection = lerp(SkyReflection(R), sceneReflection, hit);
+	}
+	float NdotV = saturate(dot(N, V));
+	float fresnel = 0.02 + (max(1.0 - SurfaceRoughness, 0.02) - 0.02) * pow(1.0 - NdotV, 5.0);
+	float3 color = lerp(water, reflection, fresnel * ReflectionStrength);
+
+	// Солнечный блик.
+	float3 H = normalize(L + V);
+	float specPower = exp2(10.0 * Smoothness + 1.0);
+	float spec = pow(saturate(dot(N, H)), specPower) * SpecularStrength * (specPower + 2.0) / 8.0;
+	color += spec * sun * fresnel * 4.0;
+
+	// Кромка: по глубине над рельефом и по глубине из симуляции.
+	float alpha = saturate(depth0 / ShoreFade) * saturate(I.SimDepth / SimEdgeFade);
+	float3 behind = SceneColorCopy.Load(int3(pixel, 0)).rgb;
+	OutColor = float4(lerp(behind, color, alpha), 1);
+	if (PlanarDebug > 0)
+	{
+		float2 suv = (pixel - View.ViewRectMin.xy) * View.ViewSizeAndInvSize.zw;
+		OutColor = float4(PlanarValid > 0.0 ? PlanarReflection.SampleLevel(PlanarSampler, suv, 0).rgb * View.PreExposure : float3(1, 0, 1), 1);
+	}
+}
+
+// ---------------------------------------------------------------- белая вода
+
+StructuredBuffer<float4> WhiteParticles; // по две float4: позиция + жизнь (0 — пусто), скорость + радиус (0 — капля)
+float WhiteBack; // с: насколько раньше состояния пула время показа (USwampWaterSubsystem::UpdateWhiteClock)
+float3 FoamColor;
+float SprayRadius;
+float Extinction;
+// Проход: 0 — пузыри под водой (до поверхности воды, на своей глубине: поверхность видит их сквозь толщу, как дно;
+// BubbleDist — их расстояние для неё), 1 — пена, брызги и всё над водой (после поверхности).
+int WhitePass;
+static const float MinWhitePixels = 1.5;
+static const float FoamSpread = 4.0;          // во сколько раз пятно пены на воде шире своего пятна пузырей
+static const float FoamDiscCoverage = 0.316;  // ∫exp(−3r²) по единичному диску / π
+static const float FoamPatchCover = 0.5;    // доля площади пятна, закрытая пузырями (между ними — вода)
+static const float FoamCell = 0.006;          // м: размер ячейки пены (пузыри 1–6 мм)
+
+struct FWhiteVaryings
+{
+	float4 Position : SV_POSITION;
+	float3 Sim : TEXCOORD0;        // точка на квадрате перед шаром
+	float4 Sphere : TEXCOORD1;     // центр и радиус по горизонтали
+	float Height : TEXCOORD2;      // полуось по вертикали
+	float3 LevelAlpha : TEXCOORD3; // x — поверхность воды (у пены — срез, у пузыря под водой — для света), y — непрозрачность, z — размер при рождении
+};
+
+void WhiteVS(uint VertexId : SV_VertexID, out FWhiteVaryings O)
+{
+	O = (FWhiteVaryings)0;
+	O.Position = float4(2, 2, 2, 1);
+	uint index = VertexId / 6;
+	float4 a = WhiteParticles[2 * index];
+	if (a.w == 0) return;
+	float4 b = WhiteParticles[2 * index + 1];
+	float3 vel = b.xyz;
+	float3 x = a.xyz - vel * WhiteBack; // у пены и пузырей скорость — весь сдвиг за шаг (WaterWhitewater Update)
+	float level;
+	if (!SimLevel(x.xz, level)) level = x.y;
+	float d = x.y - level;
+	bool submerged = b.w > 0 && d < 0;
+	if (submerged != (WhitePass == 0)) return;
+	float size = 0.5 + frac(index * 0.6180339);
+	float radius, alpha, cut = -1e9, born, height = -1;
+	bool flat = false;
+	if (b.w == 0)
+	{
+		radius = born = SprayRadius * size;
+		alpha = 0.5; // капля прозрачна: белой её делает отражение и преломление
+	}
+	else if (submerged)
+	{
+		// Пузырь под водой — шар на своём месте. Мутность между ним и глазом добавляет поверхность (по BubbleDist).
+		born = b.w;
+		radius = born;
+		alpha = 0.8;
+		cut = level;
+	}
+	else
+	{
+		born = abs(b.w);
+		radius = born >= BubbleSingle ? born : born * pow(BubbleSurvival(born, a.w), 1.0 / 3.0);
+		// Пена (радиус со знаком минус, WaterWhitewater Update) лежит на нарисованной поверхности. Поверхность между
+		// шагами едет (SimBlend), а пена стоит на уровне прошлого шага: по своей глубине в миллиметры она то ложилась
+		// пятном, то тонула бусиной — мерцала.
+		float band = 0.5 * SimParams.z;
+		bool onSurface = b.w < 0;
+		float depth = onSurface ? 0 : max(-d, 0);
+		float dome = 0.6 * radius;
+		alpha = 0.8 * exp(-2.0 * Extinction * max(depth - dome, 0));
+		if (alpha < 0.01) return;
+		// Пена на берегу (выше уровня соседних столбцов) лежит на своей высоте — на грунте.
+		x.y = onSurface && d <= band ? level : max(level, x.y);
+		cut = x.y;
+		height = max(dome - depth, 0.05 * dome);
+		// Пятно мелких пузырей у поверхности — плёнка на воде, а не бусина: мягкий диск в плоскости воды, шире
+		// пятна в FoamSpread раз и во столько же² прозрачнее (то же покрытие — соседние пятна сливаются в пену).
+		if (born < BubbleSingle && depth <= dome)
+		{
+			flat = true;
+			radius *= FoamSpread;
+			alpha *= FoamPatchCover / (0.8 * FoamSpread * FoamSpread * FoamDiscCoverage);
+			x.y += 0.01;
+		}
+	}
+	// Мельче пикселя частица не рисуется точкой во всю яркость (она мерцала белыми крапинами): она растягивается до
+	// MinWhitePixels, а непрозрачность падает как отношение площадей — пиксель покрыт той же долей, что и на деле.
+	float3 eye = TranslatedToSim(float3(0, 0, 0));
+	float pixels = radius * View.ViewToClip[1][1] * 0.5 * View.ViewSizeAndInvSize.y / max(length(eye - x), 1e-3);
+	if (pixels < MinWhitePixels)
+	{
+		float grow = MinWhitePixels / max(pixels, 1e-3);
+		alpha /= grow * grow;
+		if (alpha < 0.004) return;
+		radius *= grow;
+		if (height > 0) height *= grow;
+	}
+	static const float2 corners[6] = { float2(-1, -1), float2(1, -1), float2(1, 1), float2(-1, -1), float2(1, 1), float2(-1, 1) };
+	float2 c = corners[VertexId % 6];
+	float3 cam = TranslatedToSim(float3(0, 0, 0));
+	float3 toCamera = normalize(cam - x);
+	float3 right = normalize(cross(float3(0, 1, 0), toCamera) + float3(1e-5, 0, 0));
+	float3 up = cross(toCamera, right);
+	float3 p = x + toCamera * radius + (right * c.x + up * c.y) * radius * 1.05;
+	if (flat) p = x + float3(c.x, 0, c.y) * radius;
+	O.Sim = p;
+	O.Position = mul(float4(SimToTranslated(p), 1), View.TranslatedWorldToClip);
+	O.Sphere = float4(x, radius);
+	O.Height = flat ? -1 : (height > 0 ? height : radius);
+	O.LevelAlpha = float3(cut, alpha, born);
+}
+
+// Шар (эллипсоид) частицы: пересечение луча пикселя, цвет и непрозрачность. light — доля света, дошедшего до него.
+float4 ShadeSphere(FWhiteVaryings I, float3 cam, float3 light, out float3 p)
+{
+	float3 dir = normalize(I.Sim - cam);
+	float3 axes = float3(I.Sphere.w, I.Height, I.Sphere.w);
+	float3 o3 = (cam - I.Sphere.xyz) / axes, d3 = dir / axes;
+	float qa = dot(d3, d3), qb = dot(o3, d3);
+	float h = qb * qb - qa * (dot(o3, o3) - 1.0);
+	clip(h);
+	p = cam + dir * ((-qb - sqrt(h)) / qa);
+	float3 n = normalize((p - I.Sphere.xyz) / (axes * axes));
+	float3 L = SunDirectionSim();
+	float3 sun = SunColor() * light;
+	float diffuse = saturate(dot(n, L) * 0.4 + 0.6);
+	float occlusion = 0.7 + 0.3 * saturate(n.y * 0.5 + 0.5);
+	float3 white = FoamColor * (sun * diffuse + SkyColor(n) * light * occlusion);
+	float facing = saturate(dot(n, -dir));
+	float fresnel = 0.04 + 0.96 * pow(1.0 - facing, 4.0);
+	float spec = pow(saturate(dot(reflect(dir, n), L)), 96.0);
+	float3 film = SkyColor(reflect(dir, n)) * light * fresnel + sun * spec * 2.0;
+	float clearness = saturate((I.LevelAlpha.z - BubbleSingle) / 0.003);
+	float3 color = lerp(white, film / max(fresnel + spec, 0.05), clearness);
+	float alpha = lerp(1.0, saturate(fresnel * 1.5 + spec), clearness);
+	float rim = saturate(h / qa * 16.0);
+	return float4(color, I.LevelAlpha.y * alpha * rim);
+}
+
+void WhitePS(FWhiteVaryings I, out float4 OutColor : SV_Target0)
+{
+	float3 cam = TranslatedToSim(float3(0, 0, 0));
+	if (I.Height < 0)
+	{
+		// Плоское пятно пены: гауссово по радиусу, внутри — ячейки пузырей (шум ~ FoamCell), свет — как у матовой
+		// плёнки на воде.
+		float2 q = (I.Sim.xz - I.Sphere.xz) / I.Sphere.w;
+		float r2 = dot(q, q);
+		clip(1.0 - r2);
+		float fade = OctaveFade(length(fwidth(I.Sim.xz)), 1.0 / FoamCell); // вдали ячейки мельче пикселя — ровно
+		float cells = GradientNoiseD(I.Sim.xz / FoamCell).x * 2.0 * fade;
+		float a = I.LevelAlpha.y * exp(-3.0 * r2) * saturate(1.0 + cells);
+		float3 n = float3(0, 1, 0);
+		float3 L = SunDirectionSim();
+		float3 col = FoamColor * (SunColor() * saturate(L.y * 0.5 + 0.5) + SkyColor(n));
+		OutColor = float4(col, saturate(a));
+		float3 rayOrigin;
+		float underLevel;
+		if (RayUnderwater(I.Position.xy, rayOrigin, underLevel)) OutColor.rgb = UnderwaterFog(rayOrigin, underLevel, I.Sphere.xyz, OutColor.rgb);
+		return;
+	}
+	float3 p;
+	OutColor = ShadeSphere(I, cam, 1.0, p);
+	clip(p.y - I.LevelAlpha.x);
+	// Глаз под водой видит пену и брызги сквозь толщу (до поверхности — всё, что выше неё, — за ней же).
+	float3 rayOrigin;
+	float underLevel;
+	if (RayUnderwater(I.Position.xy, rayOrigin, underLevel))
+		OutColor.rgb = UnderwaterFog(rayOrigin, underLevel, p.y > underLevel ? rayOrigin + (p - rayOrigin) * saturate((underLevel - rayOrigin.y) / max(p.y - rayOrigin.y, 1e-4)) : p, OutColor.rgb);
+}
+
+// Пузырь под водой: свет до него спускается сквозь толщу (ослабление Kd на метр глубины, как у дна в SurfacePS).
+// Второй выход — расстояние до него (меньшее из всех, смешение Min): поверхность берёт его вместо дна, когда
+// считает толщу воды на луче. Почти прозрачные края пузыря её не перекрывают.
+static const float PatchOpticalDepth = 1.5;
+
+void BubblePS(FWhiteVaryings I, out float4 OutColor : SV_Target0, out float OutDist : SV_Target1)
+{
+	float3 cam = TranslatedToSim(float3(0, 0, 0));
+	float3 p;
+	// Свет у пузыря: прямой луч с тенью и рассеянный — относительно света над водой (ShadeSphere множит им солнце и небо).
+	float3 light = WaterLightRatio(I.Sphere.xyz, I.LevelAlpha.x);
+	OutColor = ShadeSphere(I, cam, light, p);
+	// Отдельный пузырь — граница вода→воздух: под углом падения больше критического (48.6°) свет из воды в воздух не
+	// выходит — по краю пузыря полное внутреннее отражение, в нём отражается толща (сверху — светлая). Середина
+	// почти прозрачна. Небо над водой (ShadeSphere — плёнка в воздухе) пузырь под водой отражать не может.
+	float clearness = saturate((I.LevelAlpha.z - BubbleSingle) / 0.003);
+	// Пятно мелких пузырей — облако, а не шар: непрозрачность по оптической толщине хорды τ = 1.5·φ·L/r (доля воздуха
+	// φ ~ 5%, пузыри ~1 мм, пятно ~1 см — по диаметру τ ≈ 1.5): к краю облако прозрачнее.
+	{
+		float3 dir0 = normalize(I.Sim - cam);
+		float3 o3 = (cam - I.Sphere.xyz) / I.Sphere.w, d3 = dir0 / I.Sphere.w;
+		float qa = dot(d3, d3), qb = dot(o3, d3);
+		float chord = sqrt(max(qb * qb - qa * (dot(o3, o3) - 1.0), 0)) / (qa * I.Sphere.w); // доля диаметра
+		float cloud = (1.0 - exp(-PatchOpticalDepth * chord)) * I.LevelAlpha.y / 0.8;
+		OutColor.a = lerp(cloud, OutColor.a, clearness);
+	}
+	if (clearness > 0)
+	{
+		float3 dir = normalize(p - cam);
+		float3 n = normalize(p - I.Sphere.xyz);
+		float cosI = saturate(dot(-dir, n));
+		float sin2T = WaterIOR * WaterIOR * (1.0 - cosI * cosI);
+		float R = sin2T >= 1.0 ? 1.0 : 0.02 + 0.98 * pow(1.0 - sqrt(1.0 - sin2T), 5.0);
+		float3 env = WaterPathRadiance(p, I.LevelAlpha.x, reflect(dir, n), 10.0);
+		float4 film = float4(env, R * I.LevelAlpha.y);
+		OutColor = lerp(OutColor, film, clearness);
+	}
+	OutDist = OutColor.a >= 0.3 ? distance(cam, p) : 1e6;
+}
+
+// ---------------------------------------------------------------- отладка: частицы воды (WaterParticlesDebug)
+
+struct FParticle { float px, py, pz; uint v0, v1, v2, v3, v4, v5; };
+StructuredBuffer<FParticle> DebugParticles;
+StructuredBuffer<uint> DebugCount;
+float DebugCell;
+
+void ParticlesVS(uint VertexId : SV_VertexID, out float4 Position : SV_POSITION, out float3 Color : TEXCOORD0)
+{
+	uint index = VertexId / 6;
+	Position = float4(2, 2, 2, 1);
+	Color = 0;
+	if (index >= DebugCount[0]) return;
+	FParticle p = DebugParticles[index];
+	float3 x = float3(p.px, p.py, p.pz);
+	static const float2 corners[6] = { float2(-1, -1), float2(1, -1), float2(1, 1), float2(-1, -1), float2(1, 1), float2(-1, 1) };
+	float2 c = corners[VertexId % 6];
+	float3 cam = TranslatedToSim(float3(0, 0, 0));
+	float3 toCamera = normalize(cam - x);
+	float3 right = normalize(cross(float3(0, 1, 0), toCamera) + float3(1e-5, 0, 0));
+	float3 up = cross(toCamera, right);
+	float3 w = x + (right * c.x + up * c.y) * DebugCell * 0.15;
+	Position = mul(float4(SimToTranslated(w), 1), View.TranslatedWorldToClip);
+	// Цвет — по скорости (в сетке — half в v0/v1, над сеткой — float).
+	float speed = length(float3(f16tof32(p.v0 & 0xFFFFu), f16tof32(p.v0 >> 16), f16tof32(p.v1 & 0xFFFFu)));
+	Color = lerp(float3(0.1, 0.3, 1.0), float3(1.0, 0.3, 0.1), saturate(speed / 2.0)) * View.PreExposure;
+}
+
+void ParticlesPS(float4 Position : SV_POSITION, float3 Color : TEXCOORD0, out float4 OutColor : SV_Target0)
+{
+	OutColor = float4(Color, 1);
+}

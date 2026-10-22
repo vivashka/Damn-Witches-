@@ -1,0 +1,744 @@
+#include "/Engine/Public/Platform.ush"
+// Частицы воды: сортировка по ячейкам, P2G (частицы → грани сетки), перенос (G2P + RK2), начальная вода.
+//  Сортировка кладёт частицы одной области рядом в памяти и идёт только по плиткам, что считаются, и кайме.
+//  Ключ частицы — плитка · (ячеек + 1) + ячейка в плитке (последний ключ плитки — «над сеткой»); считает
+//  частицы сам перенос (он знает, куда частица пришла), проснувшиеся — их загрузка. Префиксная сумма —
+//  внутри каждой плитки (группа на плитку), потом по плиткам (одна группа). Раскладка: частицы уснувших плиток
+//  откладываются в их место в W_Frozen, остальные — по местам.
+//  P2G — трилинейные веса, группа из 256 соседних частиц складывает импульс в общей памяти группы и один
+//  раз добавляет его в сетку (атомики в фиксированной точке).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#define WATER_VEL_READONLY // ядра частиц скорость граней только читают (перенос упирается в лимит буферов на запись)
+#define WATER_CELLS_READONLY
+#include "/Plugin/SwampWater/Private/WaterCommon.ush"
+#include "/Plugin/SwampWater/Private/WaterBubbles.ush"
+
+float W_InitLevel;
+uint W_Seed;
+// Разброс частиц при заливке: 0 — частицы ровной решёткой (вода сразу в покое), 1 — случайно внутри своей восьмушки ячейки
+float W_SeedJitter;
+float W_SleepSpeed;
+uint W_Capacity;
+
+StructuredBuffer<Particle> W_ParticlesIn;
+RWStructuredBuffer<Particle> W_ParticlesSorted;
+RWStructuredBuffer<Particle> W_ParticlesRW;     // перенос пишет частицу на то же место; сюда же — проснувшиеся
+StructuredBuffer<uint> W_ParticleCount;
+RWStructuredBuffer<uint> W_ParticleCountOut;
+RWBuffer<uint> W_Args;
+
+RWStructuredBuffer<int> W_Mom;        // импульс граней × FixedScale
+RWStructuredBuffer<int> W_Wgt;        // вес граней × FixedScale
+RWStructuredBuffer<uint> W_Count;     // частиц на ключ
+RWStructuredBuffer<uint2> W_Key;      // ключ частицы и её номер внутри ключа
+#define W_KeyIn W_Key
+RWStructuredBuffer<uint> W_CellStart; // начало ключа внутри его плитки
+RWStructuredBuffer<uint> W_TileTotal; // частиц в плитке (по последней префиксной сумме)
+RWStructuredBuffer<uint> W_SlotBase;  // начало плитки (по месту среди считаемых и каймы) в отсортированных
+RWStructuredBuffer<uint> W_Extra;     // [0], [1] — частиц над плитками без воды и сирот; [2], [3] — их начала
+#define W_ExtraIn W_Extra
+StructuredBuffer<uint> W_CellStartIn;
+StructuredBuffer<uint> W_SlotBaseIn;
+#define W_FrozenIn W_Frozen
+RWStructuredBuffer<uint> W_Stats;     // [0] — макс. скорость частиц (биты float), [1] — заявок белой воды за подшаг
+
+// Белая вода (WaterWhitewater): перенос оставляет заявки — рождение брызг, пены и пузырей там, где вода захватывает
+// воздух, и капли (вода, оторвавшаяся от поверхности) для отрисовки. По две float4: позиция + жизнь (< 0 — капля),
+// скорость + радиус пузыря (WaterBubbles.hlsl).
+Texture2D<float4> W_SurfaceIn;          // поверхность прошлого шага (WaterHeightField)
+RWStructuredBuffer<float4> W_WhiteRequests;
+uint W_WhiteCapacity;
+float W_EntrainRate;     // заявок на частицу в секунду при превышении скорости над порогом, равном самому порогу
+float W_EntrainSpeed;    // скорость, с которой вода начинает захватывать воздух, м/с
+
+StructuredBuffer<int> W_TileState;
+StructuredBuffer<int> W_TileSlot;
+RWStructuredBuffer<uint> W_TileWake;
+RWStructuredBuffer<Particle> W_Frozen; // отложенные частицы уснувших плиток: у плитки своё место
+StructuredBuffer<uint> W_FrozenStart;
+StructuredBuffer<uint> W_FrozenCap;
+RWStructuredBuffer<uint> W_FrozenCount;
+RWStructuredBuffer<int> W_TileTop;     // верхний слой частиц плитки на этом шаге (над сеткой — W_NY)
+StructuredBuffer<float> W_DispIn;      // сдвиг поправки плотности на гранях (WaterGrid CorrectionFaces, в буфере W_Mom)
+
+static const uint NoKey = 0xFFFFFFFFu;    // ушедшая — выбрасывается
+static const uint WildKey = 0xFFFFFFF0u;  // над плиткой без воды (летит над сушей)
+static const uint OrphanKey = 0xFFFFFFF1u; // в спящей плитке (ждёт, пока она проснётся)
+uint KeyStride() { return (uint)W_TileCells + 1u; }
+
+// Ключ частицы по её положению (и верх частиц плитки, пробуждение плитки сироты).
+uint ParticleKey(Particle p)
+{
+    float3 pos = ParticlePos(p);
+    if (any(pos.xz < W_GridOrigin.xz) || any(pos.xz >= W_GridOrigin.xz + W_N * W_Cell)) return NoKey; // за краем карты — ушла
+    int3 c = (int3)floor((pos - W_GridOrigin) / W_Cell);
+    int t = TileAt(c.x, c.z);
+    if (t < 0) return WildKey;
+    if (W_TileState[t] == 0)
+    {
+        if (W_TileWake[t] == 0) InterlockedOr(W_TileWake[t], 1u);
+        return OrphanKey;
+    }
+    int y = Flying(pos) ? W_NY : clamp(c.y, 0, W_NY - 1);
+    if (y > W_TileTop[t]) InterlockedMax(W_TileTop[t], y);
+    uint local = y >= W_NY ? (uint)W_TileCells : (uint)(y * TileColumns + ((c.z & 7) << 3) + (c.x & 7));
+    return (uint)t * KeyStride() + local;
+}
+
+// Посчитать одну частицу (ключ и номер внутри ключа) — атомиком в памяти устройства.
+void CountParticle(uint index, Particle p)
+{
+    uint key = ParticleKey(p), rank = 0;
+    if (key == WildKey) InterlockedAdd(W_Extra[0], 1u, rank);
+    else if (key == OrphanKey) InterlockedAdd(W_Extra[1], 1u, rank);
+    else if (key != NoKey) InterlockedAdd(W_Count[key], 1u, rank);
+    W_Key[index] = uint2(key, rank);
+}
+
+// Посчитать частицы группы из 64 (вызывают все потоки группы). Частицы отсортированы, поэтому у соседних потоков
+// часто один ключ: сначала счёт в общей памяти, потом один атомик в памяти устройства на ключ, а не на частицу.
+groupshared uint gKeyMin, gKeyMax;
+groupshared uint gKeyCount[256];
+groupshared uint gKeyBase[256];
+
+void CountGroup(uint gi, uint index, uint key, bool valid)
+{
+    if (gi == 0) { gKeyMin = 0xFFFFFFFFu; gKeyMax = 0; }
+    GroupMemoryBarrierWithGroupSync();
+    bool normal = valid && key < WildKey;
+    if (normal) { InterlockedMin(gKeyMin, key); InterlockedMax(gKeyMax, key); }
+    GroupMemoryBarrierWithGroupSync();
+    uint lo = gKeyMin, span = gKeyMax - gKeyMin;
+    bool local = gKeyMax >= lo && span < 256u;
+    if (local) for (uint j = gi; j <= span; j += 64u) gKeyCount[j] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    uint rank = 0, localRank = 0;
+    if (normal)
+    {
+        if (local) InterlockedAdd(gKeyCount[key - lo], 1u, localRank);
+        else InterlockedAdd(W_Count[key], 1u, rank);
+    }
+    else if (valid && key == WildKey) InterlockedAdd(W_Extra[0], 1u, rank);
+    else if (valid && key == OrphanKey) InterlockedAdd(W_Extra[1], 1u, rank);
+    GroupMemoryBarrierWithGroupSync();
+    if (local)
+    {
+        for (uint j = gi; j <= span; j += 64u)
+        {
+            uint n = gKeyCount[j];
+            if (n == 0) continue;
+            uint b;
+            InterlockedAdd(W_Count[lo + j], n, b);
+            gKeyBase[j] = b;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (normal && local) rank = gKeyBase[key - lo] + localRank;
+    if (valid) W_Key[index] = uint2(key, rank);
+}
+
+// Счётчики плиток списка (группа на плитку) — перед тем как перенос начнёт считать заново.
+[numthreads(256, 1, 1)]
+void ClearCounts(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    if (group.x == 0 && gi < 2) W_Extra[gi] = 0;
+    if (group.x >= W_TileCounts[W_ListSlot]) return;
+    uint base = ListTile(group.x) * KeyStride();
+    for (uint i = gi; i < KeyStride(); i += 256u) W_Count[base + i] = 0;
+}
+
+// Накопители граней считаемых плиток и каймы.
+[numthreads(64, 1, 1)]
+void ClearFaces(uint3 id : SV_DispatchThreadID)
+{
+    int3 c;
+    int i = ListCell(id.x, c);
+    if (i < 0) return;
+    for (int comp = 0; comp < 3; comp++)
+    {
+        W_Mom[i * 3 + comp] = 0;
+        W_Wgt[i * 3 + comp] = 0;
+    }
+}
+
+// Проснувшаяся плитка (группа на плитку): счётчики плитки с нуля, её отложенные частицы — в конец считаемых
+// (и посчитать их).
+groupshared uint sLoadBase, sLoadCount;
+
+[numthreads(64, 1, 1)]
+void LoadFrozen(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    if (group.x >= W_TileCounts[W_ListSlot]) return;
+    uint t = ListTile(group.x);
+    for (uint k = gi; k < KeyStride(); k += 64u) W_Count[t * KeyStride() + k] = 0;
+    if (gi == 0)
+    {
+        sLoadCount = min(W_FrozenCount[t], W_FrozenCap[t]);
+        InterlockedAdd(W_ParticleCountOut[0], sLoadCount, sLoadBase);
+        W_FrozenCount[t] = 0;
+    }
+    DeviceMemoryBarrierWithGroupSync();
+    uint start = W_FrozenStart[t];
+    for (uint i = gi; i < sLoadCount; i += 64u)
+    {
+        uint dst = sLoadBase + i;
+        if (dst >= W_Capacity) continue;
+        Particle p = W_FrozenIn[start + i];
+        W_ParticlesRW[dst] = p;
+        CountParticle(dst, p);
+    }
+}
+
+// Посчитать все частицы (после сброса и для замеров; обычно считает перенос).
+[numthreads(64, 1, 1)]
+void CountParticles(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    bool valid = id.x < W_ParticleCount[0];
+    uint key = valid ? ParticleKey(W_ParticlesIn[id.x]) : NoKey;
+    CountGroup(gi, id.x, key, valid);
+}
+
+// Исключающая префиксная сумма (Blelloch) в общей памяти: n ≤ 2048 чисел, 1024 потока.
+groupshared uint sScan[2048];
+
+uint ScanShared(uint gi)
+{
+    uint offset = 1u;
+    [unroll] for (uint d = 1024u; d > 0u; d >>= 1)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if (gi < d)
+        {
+            uint ai = offset * (2u * gi + 1u) - 1u, bi = offset * (2u * gi + 2u) - 1u;
+            sScan[bi] += sScan[ai];
+        }
+        offset <<= 1;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint total = sScan[2047];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0u) sScan[2047] = 0u;
+    [unroll] for (uint e = 1u; e < 2048u; e <<= 1)
+    {
+        offset >>= 1;
+        GroupMemoryBarrierWithGroupSync();
+        if (gi < e)
+        {
+            uint ai = offset * (2u * gi + 1u) - 1u, bi = offset * (2u * gi + 2u) - 1u;
+            uint v = sScan[ai];
+            sScan[ai] = sScan[bi];
+            sScan[bi] += v;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    return total;
+}
+
+// Внутри плитки (группа на плитку списка): начала ключей и частиц в плитке.
+[numthreads(1024, 1, 1)]
+void TileScan(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    if (group.x >= W_TileCounts[W_ListSlot]) return;
+    uint t = ListTile(group.x);
+    uint n = KeyStride(), base = t * n;
+    uint a = 2u * gi, b = a + 1u;
+    sScan[a] = a < n ? W_Count[base + a] : 0u;
+    sScan[b] = b < n ? W_Count[base + b] : 0u;
+    uint total = ScanShared(gi);
+    if (a < n) W_CellStart[base + a] = sScan[a];
+    if (b < n) W_CellStart[base + b] = sScan[b];
+    if (gi == 0) W_TileTotal[t] = total;
+}
+
+// По плиткам (одна группа, кусками по 2048): начала плиток, корзин и число частиц дальше.
+[numthreads(1024, 1, 1)]
+void BaseScan(uint gi : SV_GroupIndex)
+{
+    uint count = W_TileCounts[W_ListSlot];
+    uint carry = 0;
+    for (uint from = 0; from < count; from += 2048u)
+    {
+        uint a = from + 2u * gi, b = a + 1u;
+        sScan[2u * gi] = a < count ? W_TileTotal[ListTile(a)] : 0u;
+        sScan[2u * gi + 1u] = b < count ? W_TileTotal[ListTile(b)] : 0u;
+        uint total = ScanShared(gi);
+        if (a < count) W_SlotBase[a] = carry + sScan[2u * gi];
+        if (b < count) W_SlotBase[b] = carry + sScan[2u * gi + 1u];
+        carry += total;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0)
+    {
+        W_Extra[2] = carry;
+        W_Extra[3] = carry + W_Extra[0];
+        W_ParticleCountOut[0] = carry + W_Extra[0] + W_Extra[1];
+    }
+}
+
+// ---------------------------------------------------------------- P2G
+// P2G идёт прямо в раскладке: она и так читает каждую частицу, а читает их в порядке прошлой сортировки (частицы
+// сдвинулись меньше ячейки), поэтому 256 соседних частиц касаются небольшого блока граней. Группа находит этот
+// блок, складывает импульс и вес в общей памяти группы (быстрые атомики) и добавляет в сетку только ненулевые
+// грани. Если блок не помещается (столбцы из разных рядов), — прямо в сетку.
+#define P2G_GROUP 256
+#define LOCAL_FACES 2048
+groupshared int sMom[LOCAL_FACES];
+groupshared int sWgt[LOCAL_FACES];
+groupshared int sLoX, sLoY, sLoZ, sHiX, sHiY, sHiZ;
+
+// Вызывают все потоки группы; live — частица в сетке и отдаёт импульс.
+void Splat(uint gi, bool live, ParticleState p)
+{
+    if (gi == 0)
+    {
+        sLoX = sLoY = sLoZ = 0x7fffffff;
+        sHiX = sHiY = sHiZ = -0x7fffffff;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    int3 cell = (int3)floor((p.pos - W_GridOrigin) / W_Cell);
+    if (live)
+    {
+        InterlockedMin(sLoX, cell.x); InterlockedMin(sLoY, cell.y); InterlockedMin(sLoZ, cell.z);
+        InterlockedMax(sHiX, cell.x); InterlockedMax(sHiY, cell.y); InterlockedMax(sHiZ, cell.z);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Грани, которых касается частица ячейки c, — от c − 1 до c + 1 по каждой оси.
+    int3 lo = int3(sLoX, sLoY, sLoZ) - 1;
+    int3 ext = int3(sHiX, sHiY, sHiZ) + 2 - lo;
+    int localCount = ext.x * ext.y * ext.z * 3;
+    bool useShared = sHiX >= sLoX && localCount <= LOCAL_FACES;
+    if (useShared)
+    {
+        for (int i = (int)gi; i < localCount; i += P2G_GROUP)
+        {
+            sMom[i] = 0;
+            sWgt[i] = 0;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (live)
+    {
+        for (int comp = 0; comp < 3; comp++)
+        {
+            float3 g = FaceGridCoord(p.pos, comp);
+            int3 base = (int3)floor(g);
+            float3 f = g - base;
+            float vel = p.vel[comp];
+            float3 c = comp == 0 ? p.cx : (comp == 1 ? p.cy : p.cz);
+            for (int k = 0; k < 8; k++)
+            {
+                int3 o = int3(k & 1, (k >> 1) & 1, k >> 2);
+                float3 wv = lerp(1 - f, f, (float3)o);
+                float w = wv.x * wv.y * wv.z;
+                float3 dx = ((float3)o - f) * W_Cell;
+                int mom = (int)round(w * (vel + dot(c, dx)) * FixedScale);
+                int wgt = (int)round(w * FixedScale);
+                int3 face = base + o;
+                if (useShared)
+                {
+                    int3 l = face - lo;
+                    int li = ((l.z * ext.y + l.y) * ext.x + l.x) * 3 + comp;
+                    InterlockedAdd(sMom[li], mom);
+                    InterlockedAdd(sWgt[li], wgt);
+                }
+                else
+                {
+                    int slot = FaceSlot(comp, face);
+                    if (slot < 0) continue;
+                    InterlockedAdd(W_Mom[slot], mom);
+                    InterlockedAdd(W_Wgt[slot], wgt);
+                }
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (!useShared) return;
+    for (int i = (int)gi; i < localCount; i += P2G_GROUP)
+    {
+        int wgt = sWgt[i];
+        if (wgt == 0 && sMom[i] == 0) continue;
+        int comp = i % 3, cellLocal = i / 3;
+        int3 l = int3(cellLocal % ext.x, (cellLocal / ext.x) % ext.y, cellLocal / (ext.x * ext.y));
+        int slot = FaceSlot(comp, lo + l);
+        if (slot < 0) continue;
+        InterlockedAdd(W_Mom[slot], sMom[i]);
+        InterlockedAdd(W_Wgt[slot], wgt);
+    }
+}
+
+
+[numthreads(P2G_GROUP, 1, 1)]
+void P2G(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    bool live = id.x < W_ParticleCount[0];
+    ParticleState p = Unpack(W_ParticlesIn[live ? id.x : 0]);
+    Splat(gi, live && !Flying(p.pos), p);
+}
+
+// Раскладка в другой буфер и P2G; частицы уснувших плиток — в их отложенные. Если отложить некуда (плитке не
+// хватило места) — в конец, сиротой.
+[numthreads(P2G_GROUP, 1, 1)]
+void SortParticles(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    bool valid = id.x < W_ParticleCount[0];
+    uint2 kr = valid ? W_KeyIn[id.x] : uint2(NoKey, 0);
+    uint key = kr.x, rank = kr.y, dst = 0xFFFFFFFFu;
+    Particle p = W_ParticlesIn[valid ? id.x : 0];
+    bool live = false;
+    if (key == WildKey) dst = W_ExtraIn[2] + rank;
+    else if (key == OrphanKey) dst = W_ExtraIn[3] + rank;
+    else if (key != NoKey)
+    {
+        uint t = key / KeyStride();
+        int slot = W_TileSlot[t];
+        if (slot < 0)
+        {
+            uint index;
+            InterlockedAdd(W_FrozenCount[t], 1u, index);
+            if (index < W_FrozenCap[t]) W_Frozen[W_FrozenStart[t] + index] = p;
+            else
+            {
+                InterlockedAdd(W_ParticleCountOut[0], 1u, dst); // сирота: плитка спит, перенос её не тронет
+                InterlockedOr(W_TileWake[t], 1u);
+            }
+        }
+        else
+        {
+            dst = W_SlotBaseIn[slot] + W_CellStartIn[key] + rank;
+            live = !Flying(ParticlePos(p));
+        }
+    }
+    if (dst < W_Capacity) W_ParticlesSorted[dst] = p; // защита: запись за буфер на Metal портит чужую память
+    Splat(gi, live, Unpack(p));
+}
+
+// Поправка плотности (Kugelstadt et al. 2019): сдвиг −∇ψ посчитан на гранях (WaterGrid CorrectionFaces), здесь —
+// трилинейно в частицу. Только позиция, не скорость. Не больше четверти ячейки за шаг.
+float3 DensityCorrection(float3 x)
+{
+    float3 d;
+    [unroll] for (int comp = 0; comp < 3; comp++)
+    {
+        float3 g = FaceGridCoord(x, comp);
+        int3 b = (int3)floor(g);
+        float3 f = g - b;
+        float sum = 0;
+        for (int k = 0; k < 8; k++)
+        {
+            int3 o = int3(k & 1, (k >> 1) & 1, k >> 2);
+            float3 wv = lerp(1 - f, f, (float3)o);
+            int s = FaceSlot(comp, b + o);
+            if (s >= 0) sum += wv.x * wv.y * wv.z * W_DispIn[s];
+        }
+        if (comp == 0) d.x = sum; else if (comp == 1) d.y = sum; else d.z = sum;
+    }
+    float len = length(d), lim = 0.25 * W_Cell;
+    return len > lim ? d * (lim / len) : d;
+}
+
+void WhiteRequest(float3 pos, float3 vel, float life, float radius)
+{
+    uint i;
+    InterlockedAdd(W_Stats[1], 1u, i);
+    if (i >= W_WhiteCapacity) return;
+    W_WhiteRequests[2 * i] = float4(pos, life);
+    W_WhiteRequests[2 * i + 1] = float4(vel, radius);
+}
+
+float SurfaceAbove(float3 x)
+{
+    float4 s = W_SurfaceIn[clamp((int2)floor((x.xz - W_GridOrigin.xz) / W_Cell), 0, W_N - 1)];
+    return s.y >= 0 ? x.y - s.x : 1e9; // над сухим столбцом — вода не у поверхности
+}
+
+// n пузырей в шлейфе глубиной plume под точкой x (до дна).
+void EmitBubbles(float3 x, float3 vel, float n, float plume)
+{
+    if (n <= 0) return;
+    float4 s = W_SurfaceIn[clamp((int2)floor((x.xz - W_GridOrigin.xz) / W_Cell), 0, W_N - 1)];
+    float depth = min(plume, max(s.y, 0));
+    uint h = Hash(asuint(x.x) ^ Hash(asuint(x.y) ^ Hash(asuint(x.z))));
+    uint count = (uint)n + ((h & 0xFFFFu) < (uint)(frac(n) * 65536.0) ? 1u : 0u);
+    for (uint k = 0; k < min(count, 32u); k++)
+    {
+        h = Hash(h);
+        float3 r = float3(h & 1023u, (h >> 10) & 1023u, (h >> 20) & 1023u) / 1023.0 - 0.5;
+        h = Hash(h);
+        float radius = BubbleRadius((h & 0xFFFFu) / 65536.0);
+        float life = BubbleLife(radius, ((h >> 16) + 1u) / 65536.0);
+        h = Hash(h);
+        float3 pos = float3(x.x + r.x * 0.5 * W_Cell, s.x - depth * (h & 0xFFFFu) / 65536.0, x.z + r.z * 0.5 * W_Cell);
+        WhiteRequest(pos, vel, life, radius);
+    }
+}
+
+// Белая вода (Ihmsen et al. 2012, «Unified Spray, Foam and Bubbles for Particle-Based Fluids»): вторичные частицы
+// рождаются там, где поверхность захватывает воздух, и на воду не влияют. Сетка не держит мелких брызг и пузырей
+// (частица — литр воды), поэтому они — отдельный слой поверх неё.
+//  - Капли: частица, оторвавшаяся от воды (дальше ячейки над поверхностью столбца или над сеткой) и ни на что не
+//    опирающаяся (дальше ячейки от дна и тел), рвётся на капли — в миг отрыва, один раз: дальше капли летят сами
+//    (WaterWhitewater, тяжесть — как и у частицы). Вода, лежащая на берегу или на теле, — не брызги. Раньше капли
+//    рождались заново каждый подшаг со случайным разбросом и дрожали; плёнка на берегу и вода на кубе мерцали ими.
+//  - Воздух захватывается там, где рвётся поверхность (воду в толще ему не достать):
+//    удар — оторвавшаяся вода (wasFree) падает обратно; тело на ватерлинии — частица у поверхности рядом с телом,
+//    тело входит в воду или тащит за собой каверну (ниже). Начинается захват при ~1 м/с (падающая струя: Ervine et al. 1980;
+//    Chanson 1997) — W_EntrainSpeed; дальше воздуха тем больше, чем больше превышение: у струй расход воздуха растёт
+//    как вторая-третья степень превышения (McKeogh & Ervine 1981), у Ihmsen рождение умножается на кинетическую
+//    энергию. Здесь — квадрат превышения на частицу, которую задело; тело, кроме того, задевает их тем больше, чем
+//    быстрее проходит поверхность (× скорость: в сумме ~ куб, как у струй). Тело, упавшее с высоты, даёт пены в
+//    десятки раз больше идущего.
+//    Удар — событие: пузырей столько, сколько частица захватила бы, проходя слой у поверхности (ячейку) со своей
+//    скоростью. Разница скоростей в толще (сдвиг у Ihmsen) не в счёт: сетка размазывает обтекание тела на ячейки
+//    по 20 см, и шаги по воде давали сплошную полосу пены.
+void Whitewater(float3 x, float3 vel, bool supported, bool launched, bool wasFree, bool nearBody, float3 bodyVel, float3 bodyNormal)
+{
+    float above = SurfaceAbove(x);
+    bool detached = Flying(x) || above > W_Cell;
+    if (detached && !supported && launched) WhiteRequest(x, vel, -1, 0);
+    if (above < -W_Cell || above > 2.0 * W_Cell) return;
+    float e = W_EntrainSpeed;
+    if (wasFree && !detached)
+    {
+        // Упавшая вода — струя толщиной с частицу (полъячейки).
+        float speed = length(vel), excess = max(speed - e, 0) / e;
+        EmitBubbles(x, vel, W_EntrainRate * excess * excess * W_Cell / max(speed, e), PlumeDepth(speed, 0.5 * W_Cell));
+    }
+    if (nearBody)
+    {
+        // Вода у самого тела движется с ним (сетка): скорость тела — относительно течения поверхности столбца
+        // (по глубине, без вертикали), как невозмущённого. Вода, которую тело выплеснуло вверх (до двух ячеек над
+        // поверхностью), — тоже у ватерлинии.
+        float4 s = W_SurfaceIn[clamp((int2)floor((x.xz - W_GridOrigin.xz) / W_Cell), 0, W_N - 1)];
+        // Боковая поверхность тела (нога, борт), наступая на воду со скоростью vn (по нормали тела), тащит за собой
+        // воздушную каверну (вентиляция) только при числе Фруда по глубине погружения больше ~1: vn > √(g·h), h —
+        // глубина воды. Нога, идущая по воде, даёт волну, но не пену. Пены — квадрат превышения на частицу, которую
+        // задело, и задевает тело тем больше частиц, чем быстрее наступает (× vn: в сумме ~ куб, как у струй).
+        // Вход тела сверху (удар) — WaterBodyForces: он короче шага воды.
+        float3 rel = bodyVel - float3(s.z, 0, s.w);
+        float vn = dot(rel, bodyNormal);
+        float onset = sqrt(W_Gravity * max(s.y, W_Cell));
+        float excess = max(vn - onset, 0) / e;
+        EmitBubbles(x, vel, W_EntrainRate * excess * excess * (vn / e) * W_Dt, PlumeDepth(vn, W_Cell));
+    }
+}
+
+// Проскальзывание (Losasso, Talton, Kwatra & Fedkiw 2008, «Two-way coupled SPH and particle level set fluid
+// simulation», IEEE TVCG 14): давление держит несжимаемой только сплошную воду. Среди брызг — воздух, давление ноль,
+// и вода летит по своей инерции под одной тяжестью. Сетка же продолжает в воздушные ячейки скорость воды снизу, и
+// вода, выбитая телом вверх, через шаг шла обратно вместе с остановившейся водой под ней: всплеска не было.
+// Доля s, с которой частица подчиняется сетке, — по тому, насколько полна вода вокруг (доля воды f, трилинейно по
+// центрам соседних ячеек, без дна и тел): у Losasso s = плотность / плотность сплошной воды, а где её меньше ~15% —
+// частицы чисто баллистические. Здесь сплошная — с f = ½ (ячейка — вода для давления, Classify): s = 1 от неё и
+// выше, 0 — ниже 0.15, между — линейно.
+static const float SlipBallistic = 0.15;
+
+float Slip(float3 x)
+{
+    float3 g = (x - W_GridOrigin) / W_Cell - 0.5;
+    int3 b = (int3)floor(g);
+    float3 t = g - b;
+    float sum = 0, weight = 0;
+    for (int k = 0; k < 8; k++)
+    {
+        int3 o = int3(k & 1, (k >> 1) & 1, k >> 2);
+        int3 c = b + o;
+        float3 wv = lerp(1 - t, t, (float3)o);
+        float w = wv.x * wv.y * wv.z;
+        if (c.y >= W_NY) { weight += w; continue; } // над сеткой — воздух
+        int i = CellIndex(c);
+        [branch] if (i >= 0) // суша, дно и тела — стенка, не воздух и не вода (|| в HLSL читал бы W_Type[−1])
+        {
+            [branch] if (W_Type[i] != Solid)
+            {
+                sum += w * Fill(i);
+                weight += w;
+            }
+        }
+    }
+    float f = weight > 0 ? sum / weight : 0;
+    return saturate((f - SlipBallistic) / (0.5 - SlipBallistic));
+}
+
+// Опора: ближе ячейки к дну или телу (лежащая вода — слой частиц на них).
+bool Supported(float3 x)
+{
+    if (x.y - BedHeight(x.xz) < W_Cell) return true;
+    float3 n, v;
+    return NearestObstacle(x, n, v) < W_Cell;
+}
+
+// G2P (APIC) + перенос RK2 + выталкивание из тел и дна. Только частицы считаемых плиток (и летящие над плитками
+// без воды); кайма и сироты стоят. Частица пишется на то же место, ушедшая помечается — её выбросит сортировка.
+// Тут же частица считается для сортировки следующего шага.
+// Частица, сдвинувшаяся быстрее W_SleepSpeed, будит плитку, куда пришла.
+void Move(inout Particle packed, float3 x0, int3 c0, uint index)
+{
+    ParticleState p = Unpack(packed);
+    float3 x = x0;
+    float3 corr = 0; // поправка плотности — не течение: плитку не будит
+
+    // Оторвавшаяся вода (дальше ячейки над поверхностью столбца) летит сама, как над сеткой: скорость в воздушных
+    // ячейках сетка лишь продолжает из воды, и вода, плеснувшая на плавающий куб, висела на нём со скоростью воды
+    // под ним (около нуля), не стекая.
+    bool free = !InsideGrid(x0) || SurfaceAbove(x0) > W_Cell;
+    // Отрывается в этот подшаг: была у воды или опиралась на дно или тело.
+    bool launched = true;
+    [branch] if (free) launched = Supported(x0); // || в HLSL считает обе стороны
+    if (!free)
+    {
+        // Вода на дне (плёнка на берегу) течёт с сеткой: там трение о дно (Маннинг), его у баллистики нет.
+        float s = x.y - BedHeight(x.xz) < 0.5 * W_Cell ? 1 : Slip(x);
+        float3 own = p.vel - float3(0, W_Gravity * W_Dt, 0);
+        float3 vg = SampleGrid(x, p.cx, p.cy, p.cz);
+        p.vel = lerp(own, vg, s);
+        p.cx *= s; p.cy *= s; p.cz *= s; // вращение и сдвиг ячейки — только у той доли, что идёт с сеткой
+        float3 mid = x + 0.5 * W_Dt * vg;
+        x += W_Dt * lerp(own, InsideGrid(mid) ? SampleGrid(mid) : vg, s);
+        if (W_Correct != 0)
+        {
+            corr = DensityCorrection(x);
+            x += corr;
+        }
+    }
+    else
+    {
+        // Над сеткой, над сушей (там сетки нет) и оторвавшись от воды — только тяжесть.
+        p.cx = 0; p.cy = 0; p.cz = 0;
+        p.vel.y -= W_Gravity * W_Dt;
+        x += W_Dt * p.vel;
+    }
+
+    // Тела.
+    float3 n, sv;
+    float d = NearestObstacle(x, n, sv);
+    if (d < 0)
+    {
+        x -= n * d;
+        float vn = dot(p.vel - sv, n);
+        if (vn < 0) p.vel -= n * vn;
+    }
+    // Дно: опора — по нормали дна, гасится только скорость в дно. Раньше частица возвращалась строго вверх и теряла
+    // вертикальную скорость: на склоне тяжесть не тянула её вдоль дна, и плёнка, плеснувшая на берег, висела вечно.
+    float bed = BedHeight(x.xz);
+    bool hitBed = x.y < bed;
+    if (hitBed)
+    {
+        float e = 0.5 * W_Cell;
+        float3 bn = normalize(float3(BedHeight(x.xz - float2(e, 0)) - BedHeight(x.xz + float2(e, 0)), 2.0 * e,
+            BedHeight(x.xz - float2(0, e)) - BedHeight(x.xz + float2(0, e))));
+        x += bn * ((bed - x.y) * bn.y);
+        x.y = max(x.y, BedHeight(x.xz));
+        float vn = dot(p.vel, bn);
+        if (vn < 0) p.vel -= bn * vn;
+    }
+
+    float top = GridTop();
+    int3 cell = (int3)floor((x - W_GridOrigin) / W_Cell);
+    if (x.y < top && CellIndex(cell) < 0 && hitBed)
+    {
+        // Суша (столбец вне сетки): частица ударилась о землю или берег — неупругий удар, вода осталась лежать там,
+        // где была (вне сетки она не течёт). Иначе тяжесть разгоняла бы её вечно. В воздухе над сушей она летит
+        // дальше: раньше и там останавливалась и висела в воздухе.
+        x = float3(x0.x, max(BedHeight(x0.xz), min(x0.y, top - 1e-3)), x0.z);
+        p.vel = 0;
+        cell = (int3)floor((x - W_GridOrigin) / W_Cell);
+    }
+    Whitewater(x, p.vel, x.y - BedHeight(x.xz) < W_Cell || d < W_Cell, launched, free, d < 0.5 * W_Cell, sv, n);
+    p.pos = x; // за краем карты — ушла, над сеткой — летит (ParticleKey, Flying)
+    uint speedBits = asuint(length(p.vel));
+    if (speedBits > W_Stats[0]) InterlockedMax(W_Stats[0], speedBits); // атомик — только быстрее записанного (адрес один на всех)
+    // Будит то, что сдвинулось: частица, лежащая на дне, разгоняется тяжестью и тут же упирается в дно — скорость
+    // у неё есть, движения нет.
+    float moved = length(x - corr - x0) / max(W_Dt, 1e-6);
+    int t1 = TileAt(cell.x, cell.z);
+    if (t1 >= 0 && (moved > W_SleepSpeed || (Flying(x) && any(p.vel != 0))) && W_TileWake[t1] == 0) InterlockedOr(W_TileWake[t1], 1u);
+    packed = Pack(p);
+    W_ParticlesRW[index] = packed;
+}
+
+[numthreads(64, 1, 1)]
+void Advect(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    bool valid = id.x < W_ParticleCount[0];
+    Particle p = W_ParticlesRW[valid ? id.x : 0];
+    float3 x0 = ParticlePos(p);
+    int3 c0 = (int3)floor((x0 - W_GridOrigin) / W_Cell);
+    int t0 = TileAt(c0.x, c0.z);
+    // Ушедшие, сироты и кайма стоят — только посчитать.
+    if (valid && (t0 < 0 || W_TileState[t0] == 2)) Move(p, x0, c0, id.x);
+    CountGroup(gi, id.x, valid ? ParticleKey(p) : NoKey, valid);
+}
+
+// Вода до стартового уровня: 2×2×2 частицы на ячейку со случайным сдвигом (равномерно, как в Kugelstadt et al.:
+// доля воды по весам граней тогда сразу равна покою).
+[numthreads(64, 1, 1)]
+void Seed(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= W_TileCount * W_TileCells) return;
+    int3 c = CellCoord(i);
+    if (CellIndex(c) < 0) return; // суша
+    uint h = Hash((uint)i * 7919u + W_Seed);
+    for (int k = 0; k < 8; k++)
+    {
+        int3 o = int3(k & 1, (k >> 1) & 1, k >> 2);
+        h = Hash(h);
+        float3 jitter = 0.5 + (float3(h & 1023u, (h >> 10) & 1023u, (h >> 20) & 1023u) / 1024.0 - 0.5) * W_SeedJitter;
+        float3 x = W_GridOrigin + ((float3)c + ((float3)o + jitter) * 0.5) * W_Cell;
+        if (x.y >= W_InitLevel || x.y < BedHeight(x.xz)) continue;
+        float3 n, v;
+        if (NearestObstacle(x, n, v) < 0) continue;
+        ParticleState s;
+        s.pos = x; s.vel = 0; s.cx = 0; s.cy = 0; s.cz = 0;
+        Particle p = Pack(s);
+        uint dst;
+        InterlockedAdd(W_ParticleCountOut[0], 1u, dst);
+        if (dst < W_Capacity) W_ParticlesSorted[dst] = p;
+    }
+}
+
+[numthreads(1, 1, 1)]
+void PrepareArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint count = W_ParticleCount[0];
+    W_Args[0] = max((count + 63u) / 64u, 1u);
+    W_Args[1] = 1;
+    W_Args[2] = 1;
+    W_Args[3] = max((count + 255u) / 256u, 1u); // для P2G (группы по 256)
+    W_Args[4] = 1;
+    W_Args[5] = 1;
+}
+
+
+// Число частиц после раскладки (из BaseScan и сирот) — в основной счётчик, и аргументы запусков.
+StructuredBuffer<uint> W_NewCount;
+
+[numthreads(1, 1, 1)]
+void FinishSort(uint3 id : SV_DispatchThreadID)
+{
+    uint count = W_NewCount[0];
+    W_ParticleCountOut[0] = count;
+    W_Args[0] = max((count + 63u) / 64u, 1u);
+    W_Args[1] = 1;
+    W_Args[2] = 1;
+    W_Args[3] = max((count + 255u) / 256u, 1u);
+    W_Args[4] = 1;
+    W_Args[5] = 1;
+}

@@ -1,0 +1,457 @@
+#include "/Engine/Public/Platform.ush"
+// Давление воды: геометрический мультигрид (V-цикл, красно-чёрный Гаусс–Зейдель) для φ = p/ρ.
+// Свободная поверхность — ghost fluid на мелком уровне. Считаются только плитки состояния 2 (WaterTiles),
+// ячейки остальных — стенка (Solid).
+// Плитки уровней совпадают (у плитки уровня L (8 >> L)² столбцов по W_NY_L ячеек), поэтому всё, кроме связи
+// соседей, внутри плитки: группа на плитку загружает её с каймой соседних ячеек в общую память, сглаживает
+// там (кайма — значения соседей на момент загрузки: между плитками это блочный Якоби, внутри — Гаусс–Зейдель),
+// считает невязку и сразу переносит её на крупный уровень (MGDown) или, на обратном пути, берёт поправку с
+// крупного и сглаживает (MGUp). V-цикл — 7 запусков.
+
+
+
+
+
+
+
+#include "/Plugin/SwampWater/Private/WaterCommon.ush"
+
+// Уровень, по которому идёт ядро (W_L), и соседний крупнее (W_C: туда невязка, оттуда поправка).
+int W_LShift;
+int W_LNY;
+int W_LBlock;
+float W_LH;
+int W_LFine;
+int W_Sweeps;
+RWStructuredBuffer<int> W_LType;
+RWStructuredBuffer<float> W_LX;
+RWStructuredBuffer<float> W_LF;
+int W_CShift;
+int W_CNY;
+int W_CBlock;
+RWStructuredBuffer<int> W_CType;
+RWStructuredBuffer<float> W_CX;
+RWStructuredBuffer<float> W_CF;
+
+// Крупные уровни (плитка 4×4 и 2×2 столбца) — те же ядра с маленькой группой и общей памятью по размеру
+// (SMALL_TILE): так на ядре GPU помещается больше групп и меньше ждём память.
+#define MAX_NY 24
+#ifdef SMALL_TILE
+#define MG_THREADS 64
+#define CELLS_PER_THREAD 3                    // 16·MAX_NY/2 / MG_THREADS
+#define TILE_SIDE 4
+#define TILE_NY (MAX_NY / 2)
+#else
+#define MG_THREADS 256
+#define CELLS_PER_THREAD 6                    // 64·MAX_NY / MG_THREADS
+#define TILE_SIDE 8
+#define TILE_NY MAX_NY
+#endif
+groupshared float gX[(TILE_SIDE + 2) * (TILE_SIDE + 2) * (TILE_NY + 2)]; // плитка с каймой; остальное у потока в регистрах
+groupshared int gYMin, gYMax;                 // слои плитки, где есть вода
+groupshared uint gTypes[TILE_SIDE * TILE_SIDE * TILE_NY / 4]; // тип ячейки, 8 бит (для переноса невязки)
+#define gR gX                                 // невязка (для переноса) — на месте gX, когда он уже не нужен
+
+// Диагональ и соседи-вода мелкого уровня — раз за шаг (WaterGrid, вместе с правой частью), крупных — при загрузке.
+RWStructuredBuffer<float> W_Diag;
+RWStructuredBuffer<uint> W_Mask; // биты 0–5: сосед — вода; 6–7: тип ячейки
+
+int LevelIndex(int3 c, int shift, int ny, int block)
+{
+    int side = W_NT << shift;
+    if (c.y < 0 || c.y >= ny || c.x < 0 || c.z < 0 || c.x >= side || c.z >= side) return -1;
+    int t = W_TileMap[(c.z >> shift) * W_NT + (c.x >> shift)];
+    if (t < 0) return -1;
+    int ts = 1 << shift, m = ts - 1;
+    return t * block + ((c.y * ts + (c.z & m)) << shift) + (c.x & m);
+}
+
+int LIndex(int3 c) { return LevelIndex(c, W_LShift, W_LNY, W_LBlock); }
+
+int LType(int3 c)
+{
+    if (c.y >= W_LNY) return Air;
+    int i = LIndex(c);
+    return i < 0 ? Solid : W_LType[i];
+}
+
+// Ячейка i плитки (i = (y·s + z)·s + x) → координаты в плитке.
+int3 TileLocal(uint i, int shift)
+{
+    uint s = 1u << shift;
+    return int3((int)(i & (s - 1u)), (int)(i >> (2 * shift)), (int)((i >> shift) & (s - 1u)));
+}
+
+uint HaloIndex(int3 l, int side) { return (uint)(((l.y + 1) * (side + 2) + (l.z + 1)) * (side + 2) + (l.x + 1)); }
+
+// Диагональ и соседи-вода ячейки c уровня W_L.
+void Coefficients(int3 c, int type, out float diag, out uint mask)
+{
+    diag = 0;
+    mask = (uint)type << 6;
+    if (type != Liquid) return;
+    for (int k = 0; k < 6; k++)
+    {
+        int tn = LType(c + Neighbours[k]);
+        if (tn == Solid) continue;
+        if (tn == Air) { diag += W_LFine == 1 ? 1.0 / FluidFraction(c, c + Neighbours[k]) : 1.0; continue; }
+        diag += 1.0;
+        mask |= 1u << k;
+    }
+}
+
+
+
+// Ячейки плитки у потока: i = gBase + gi + k·MG_THREADS, только слои плитки, где что-то может меняться
+// (W_TileRange, на крупных уровнях — его родители): ниже — дно во всех столбцах, выше — воздух.
+groupshared uint gBase, gEnd;
+struct TileCells
+{
+    float f[CELLS_PER_THREAD];
+    float d[CELLS_PER_THREAD];
+    uint m[CELLS_PER_THREAD];
+};
+
+uint CellCount() { return (uint)((1 << (2 * W_LShift)) * W_LNY); }
+uint SlotCell(uint gi, int k) { return gBase + gi + (uint)k * MG_THREADS; }
+
+// Плитка t уровня W_L: свои ячейки — в регистры, значения с каймой — в общую память (только слои с водой ±1).
+void LoadTile(uint t, uint gi, out TileCells cells)
+{
+    int side = 1 << W_LShift;
+    int2 tc = W_TileCoord[t];
+    int3 origin = int3(tc.x * side, 0, tc.y * side);
+    if (gi == 0)
+    {
+        gYMin = 0x7fffffff; gYMax = -1;
+        int level = 3 - W_LShift;
+        int2 range = W_TileRange[t];
+        uint layer = (uint)(side * side);
+        gBase = (uint)(range.x >> level) * layer;
+        gEnd = (uint)min(W_LNY, (range.y >> level) + 1) * layer;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (int k = 0; k < CELLS_PER_THREAD; k++)
+    {
+        uint i = SlotCell(gi, k);
+        float f = 0, d = 0;
+        uint m = (uint)Solid << 6;
+        if (i < gEnd)
+        {
+            uint idx = t * (uint)W_LBlock + i;
+            if (W_LFine == 1)
+            {
+                m = W_Mask[idx];
+                d = W_Diag[idx];
+            }
+            else
+            {
+                Coefficients(origin + TileLocal(i, W_LShift), W_LType[idx], d, m);
+            }
+            f = W_LF[idx];
+            if ((m >> 6) == (uint)Liquid)
+            {
+                int y = (int)(i >> (2 * W_LShift));
+                InterlockedMin(gYMin, y);
+                InterlockedMax(gYMax, y);
+            }
+        }
+        cells.f[k] = f;
+        cells.d[k] = d;
+        cells.m[k] = m;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gYMax < 0) return; // воды нет
+    uint row = (uint)(side + 2);
+    uint from = (uint)gYMin * row * row, to = (uint)(gYMax + 3) * row * row; // слои yMin−1 … yMax+1 (сдвиг каймы +1)
+    for (uint h = from + gi; h < to; h += MG_THREADS)
+    {
+        int3 l = int3((int)(h % row), (int)(h / (row * row)), (int)((h / row) % row)) - 1;
+        int idx = LIndex(origin + l);
+        gX[h] = idx >= 0 ? W_LX[idx] : 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+}
+
+float NeighbourSum(uint i, uint m, int side)
+{
+    uint h = HaloIndex(TileLocal(i, W_LShift), side);
+    uint row = (uint)(side + 2), layer = row * row;
+    float sum = 0;
+    if (m & 1u) sum += gX[h + 1];
+    if (m & 2u) sum += gX[h - 1];
+    if (m & 4u) sum += gX[h + layer];
+    if (m & 8u) sum += gX[h - layer];
+    if (m & 16u) sum += gX[h + row];
+    if (m & 32u) sum += gX[h - row];
+    return sum;
+}
+
+bool Liquidity(uint m) { return (m >> 6) == (uint)Liquid; }
+
+void SmoothTile(uint gi, TileCells cells, int sweeps)
+{
+    int side = 1 << W_LShift;
+    float h2 = W_LH * W_LH;
+    for (int hs = 0; hs < sweeps * 2; hs++)
+    {
+        [unroll] for (int k = 0; k < CELLS_PER_THREAD; k++)
+        {
+            uint i = SlotCell(gi, k);
+            if (i >= gEnd || !Liquidity(cells.m[k]) || cells.d[k] <= 0) continue;
+            int3 l = TileLocal(i, W_LShift);
+            if (((l.x + l.y + l.z) & 1) != (hs & 1)) continue;
+            gX[HaloIndex(l, side)] = (cells.f[k] * h2 + NeighbourSum(i, cells.m[k], side)) / cells.d[k];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+void StoreTile(uint t, uint gi, TileCells cells)
+{
+    int side = 1 << W_LShift;
+    [unroll] for (int k = 0; k < CELLS_PER_THREAD; k++)
+    {
+        uint i = SlotCell(gi, k);
+        if (i < gEnd && Liquidity(cells.m[k])) W_LX[t * (uint)W_LBlock + i] = gX[HaloIndex(TileLocal(i, W_LShift), side)];
+    }
+}
+
+// Невязка сглаженной плитки — на крупный уровень (ячейка крупного — вода, если вода хоть в одной дочерней;
+// невязка — средняя по водным дочерним; начальное приближение там — ноль).
+void RestrictTile(uint t, uint gi, TileCells cells, bool hasWater)
+{
+    int side = 1 << W_LShift;
+    float h2 = W_LH * W_LH;
+    float res[CELLS_PER_THREAD];
+    [unroll] for (int k = 0; k < CELLS_PER_THREAD; k++)
+    {
+        uint i = SlotCell(gi, k);
+        uint m = cells.m[k];
+        float r = 0;
+        if (i < gEnd && hasWater && Liquidity(m))
+        {
+            float x = gX[HaloIndex(TileLocal(i, W_LShift), side)];
+            r = cells.f[k] - (cells.d[k] * x - NeighbourSum(i, m, side)) / h2;
+        }
+        res[k] = r;
+        if (i < gEnd && (i & 3u) == 0) gTypes[i >> 2] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync(); // gX больше не нужен — невязка ложится на его место (gR)
+    [unroll] for (int k2 = 0; k2 < CELLS_PER_THREAD; k2++)
+    {
+        uint i = SlotCell(gi, k2);
+        if (i >= gEnd) continue;
+        gR[i] = res[k2];
+        InterlockedOr(gTypes[i >> 2], (cells.m[k2] >> 6) << ((i & 3u) * 8u));
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint coarse = (uint)((1 << (2 * W_CShift)) * W_CNY);
+    for (uint j = gi; j < coarse; j += MG_THREADS)
+    {
+        int3 cl = TileLocal(j, W_CShift);
+        int liquid = 0, solid = 0, inside = 0;
+        float r = 0;
+        for (int k = 0; k < 8; k++)
+        {
+            int3 f = cl * 2 + int3(k & 1, (k >> 1) & 1, k >> 2);
+            if (f.y >= W_LNY) continue;
+            inside++;
+            uint fi = (uint)(((f.y * side) + f.z) * side + f.x);
+            uint type = fi < gBase ? (uint)Solid : (fi >= gEnd ? (uint)Air : (gTypes[fi >> 2] >> ((fi & 3u) * 8u)) & 0xFFu);
+            if (type == (uint)Liquid) { liquid++; r += gR[fi]; }
+            else if (type == (uint)Solid) solid++;
+        }
+        uint ci = t * (uint)W_CBlock + j;
+        W_CType[ci] = liquid > 0 ? Liquid : (solid == inside ? Solid : Air);
+        W_CF[ci] = liquid > 0 ? r / liquid : 0;
+        W_CX[ci] = 0;
+    }
+}
+
+// Поправка с крупного уровня (W_C) — значение ячейки-родителя (постоянная: с ней согласован оператор крупного
+// уровня по Галёркину; трилинейная с ним сходится хуже), для ячеек плитки и каймы: каждая группа считает её
+// сама, одинаково с соседями.
+groupshared float gC[(TILE_SIDE / 2 + 2) * (TILE_SIDE / 2 + 2) * (TILE_NY / 2 + 3)];
+static const float SolidMark = 3.0e38; // NaN при быстрой математике может не распознаться
+
+void CoarseCorrection(uint t, uint gi)
+{
+    int side = 1 << W_LShift, cside = 1 << W_CShift;
+    int2 tc = W_TileCoord[t];
+    int3 corigin = int3(tc.x * cside, 0, tc.y * cside);
+    uint crow = (uint)(cside + 2);
+    uint chalo = crow * crow * (uint)(W_CNY + 2);
+    for (uint h = gi; h < chalo; h += MG_THREADS)
+    {
+        int3 l = int3((int)(h % crow), (int)(h / (crow * crow)), (int)((h / crow) % crow)) - 1;
+        float v;
+        if (l.y >= W_CNY) v = 0; // над сеткой — воздух
+        else
+        {
+            int idx = LevelIndex(corigin + l, W_CShift, W_CNY, W_CBlock);
+            int type = idx < 0 ? Solid : W_CType[idx];
+            v = type == Liquid ? W_CX[idx] : (type == Air ? 0 : SolidMark); // твёрдая — пометка
+        }
+        gC[h] = v;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint row = (uint)(side + 2);
+    uint from = (uint)gYMin * row * row, to = (uint)(gYMax + 3) * row * row;
+    for (uint h2 = from + gi; h2 < to; h2 += MG_THREADS)
+    {
+        int3 f = int3((int)(h2 % row), (int)(h2 / (row * row)), (int)((h2 / row) % row)) - 1;
+        float parent = gC[HaloIndex(f >> 1, cside)]; // родитель (floor и для −1)
+        gX[h2] += parent >= SolidMark ? 0 : parent;
+    }
+    GroupMemoryBarrierWithGroupSync();
+}
+
+// Спуск: сгладить, невязку — на крупный уровень.
+void DownBody(uint3 group, uint gi)
+{
+    if (group.x >= W_TileCounts[W_ListSlot]) return;
+    uint t = ListTile(group.x);
+    TileCells cells;
+    LoadTile(t, gi, cells);
+    bool hasWater = gYMax >= 0;
+    if (hasWater)
+    {
+        SmoothTile(gi, cells, W_Sweeps);
+        StoreTile(t, gi, cells);
+    }
+    RestrictTile(t, gi, cells, hasWater);
+}
+
+// Подъём: поправка с крупного уровня, сгладить.
+void UpBody(uint3 group, uint gi)
+{
+    if (group.x >= W_TileCounts[W_ListSlot]) return;
+    uint t = ListTile(group.x);
+    TileCells cells;
+    LoadTile(t, gi, cells);
+    if (gYMax < 0) return;
+    CoarseCorrection(t, gi);
+    SmoothTile(gi, cells, W_Sweeps);
+    StoreTile(t, gi, cells);
+}
+
+[numthreads(MG_THREADS, 1, 1)] void MGDown(uint3 group : SV_GroupID, uint gi : SV_GroupIndex) { DownBody(group, gi); }
+[numthreads(MG_THREADS, 1, 1)] void MGUp(uint3 group : SV_GroupID, uint gi : SV_GroupIndex) { UpBody(group, gi); }
+[numthreads(MG_THREADS, 1, 1)] void MGDownSmall(uint3 group : SV_GroupID, uint gi : SV_GroupIndex) { DownBody(group, gi); }
+[numthreads(MG_THREADS, 1, 1)] void MGUpSmall(uint3 group : SV_GroupID, uint gi : SV_GroupIndex) { UpBody(group, gi); }
+
+// Самый крупный уровень (плитка — один столбец) целиком одной группой, все проходы за один запуск. Если его
+// ячейки помещаются в общую память (COARSE_MAX), они там: коэффициенты и соседи — один раз, проходы — без
+// обращений к памяти устройства. Иначе — по памяти устройства с барьерами.
+#define COARSE_MAX 6144
+#define COARSE_PER_THREAD 6
+groupshared float gCoarse[COARSE_MAX];
+StructuredBuffer<int> W_SimIndex;
+
+float CoarseCell(uint j, out float diag, out float f, out int4 nb, out uint mask, out uint parity)
+{
+    uint si = j / (uint)W_LNY;
+    int y = (int)(j - si * (uint)W_LNY);
+    uint t = ListTile(si);
+    uint i = t * (uint)W_LBlock + (uint)y;
+    int2 tc = W_TileCoord[t];
+    int3 c = int3(tc.x, y, tc.y);
+    diag = 0; mask = 0; nb = -1;
+    parity = (uint)(c.x + c.y + c.z) & 1u;
+    f = W_LF[i];
+    if (W_LType[i] != Liquid) return W_LX[i];
+    mask = 64u; // своя ячейка — вода
+    for (int k = 0; k < 6; k++)
+    {
+        int3 n = c + Neighbours[k];
+        int tn = LType(n);
+        if (tn == Solid) continue;
+        diag += 1.0;
+        if (tn != Liquid) continue;
+        mask |= 1u << k;
+    }
+    // Соседи по горизонтали — места их плиток в списке (у несчитаемых плиток крупный уровень — стенка).
+    nb = int4(TileAt((c.x + 1) * 8, c.z * 8), TileAt((c.x - 1) * 8, c.z * 8), TileAt(c.x * 8, (c.z + 1) * 8), TileAt(c.x * 8, (c.z - 1) * 8));
+    nb = int4(nb.x >= 0 ? W_SimIndex[nb.x] : -1, nb.y >= 0 ? W_SimIndex[nb.y] : -1, nb.z >= 0 ? W_SimIndex[nb.z] : -1, nb.w >= 0 ? W_SimIndex[nb.w] : -1);
+    return W_LX[i];
+}
+
+[numthreads(1024, 1, 1)]
+void MGCoarsest(uint gi : SV_GroupIndex)
+{
+    uint count = W_TileCounts[W_ListSlot];
+    uint total = count * (uint)W_LBlock;
+    float h2 = W_LH * W_LH;
+    if (total <= COARSE_MAX)
+    {
+        float cd[COARSE_PER_THREAD], cf[COARSE_PER_THREAD];
+        int4 cn[COARSE_PER_THREAD];
+        uint cm[COARSE_PER_THREAD], cp[COARSE_PER_THREAD];
+        [unroll] for (int k = 0; k < COARSE_PER_THREAD; k++)
+        {
+            uint j = gi + (uint)k * 1024u;
+            cd[k] = 0; cf[k] = 0; cn[k] = -1; cm[k] = 0; cp[k] = 0;
+            if (j >= total) continue;
+            float d, f; int4 nb; uint m, p;
+            gCoarse[j] = CoarseCell(j, d, f, nb, m, p);
+            cd[k] = d; cf[k] = f; cn[k] = nb; cm[k] = m; cp[k] = p;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        uint ny = (uint)W_LNY;
+        for (int hs = 0; hs < W_Sweeps * 2; hs++)
+        {
+            [unroll] for (int k = 0; k < COARSE_PER_THREAD; k++)
+            {
+                uint j = gi + (uint)k * 1024u;
+                uint m = cm[k];
+                if (j >= total || m == 0 || cp[k] != (uint)(hs & 1) || cd[k] <= 0) continue;
+                uint y = j % ny;
+                float sum = 0;
+                if (m & 1u) sum += gCoarse[(uint)cn[k].x * ny + y];
+                if (m & 2u) sum += gCoarse[(uint)cn[k].y * ny + y];
+                if (m & 4u) sum += gCoarse[j + 1];
+                if (m & 8u) sum += gCoarse[j - 1];
+                if (m & 16u) sum += gCoarse[(uint)cn[k].z * ny + y];
+                if (m & 32u) sum += gCoarse[(uint)cn[k].w * ny + y];
+                gCoarse[j] = (cf[k] * h2 + sum) / cd[k];
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        [unroll] for (int k2 = 0; k2 < COARSE_PER_THREAD; k2++)
+        {
+            uint j = gi + (uint)k2 * 1024u;
+            if (j >= total || cm[k2] == 0) continue;
+            uint si = j / ny;
+            W_LX[ListTile(si) * (uint)W_LBlock + (j - si * ny)] = gCoarse[j];
+        }
+        return;
+    }
+    for (int hs = 0; hs < W_Sweeps * 2; hs++)
+    {
+        for (uint j = gi; j < total; j += 1024u)
+        {
+            uint si = j / (uint)W_LBlock;
+            uint t = ListTile(si);
+            uint local = j - si * (uint)W_LBlock;
+            uint i = t * (uint)W_LBlock + local;
+            if (W_LType[i] != Liquid) continue;
+            int2 tc = W_TileCoord[t];
+            int3 c = int3(tc.x << W_LShift, 0, tc.y << W_LShift) + TileLocal(local, W_LShift);
+            if (((c.x + c.y + c.z) & 1) != (hs & 1)) continue;
+            float diag = 0, sum = 0;
+            for (int k = 0; k < 6; k++)
+            {
+                int3 n = c + Neighbours[k];
+                int tn = LType(n);
+                if (tn == Solid) continue;
+                diag += 1.0;
+                if (tn == Liquid) sum += W_LX[LIndex(n)];
+            }
+            if (diag > 0) W_LX[i] = (W_LF[i] * h2 + sum) / diag;
+        }
+        DeviceMemoryBarrierWithGroupSync();
+    }
+}

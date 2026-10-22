@@ -1,0 +1,410 @@
+// Общее для compute-шейдеров воды (WaterTiles, WaterParticles, WaterGrid, WaterPressure, WaterHeightField):
+// вода — одна трёхмерная модель на всю карту, несжимаемая жидкость со свободной поверхностью,
+// APIC-частицы (Jiang et al. 2015) на MAC-сетке.
+// Сетка разбита на плитки 8×8 столбцов на всю высоту (W_NY ячеек). Плитка хранится, если в ней есть хоть один
+// столбец, куда вода может набежать; остальные столбцы плитки — суша (для воды стенка). Ячейка плитки t:
+// t·W_TileCells + y·64 + z·8 + x (x, z — внутри плитки), так ячейки плитки лежат подряд и считать можно только
+// нужные плитки. У ячейки три грани — нижние по осям (−x, −y, −z), слот грани = ячейка·3 + ось.
+// Частицы выше сетки летят сами (брызги).
+// Спящая вода: плитки, где ничего не движется, не считаются (WaterTiles). Состояние плитки: 2 — считается,
+// 1 — кайма (её частицы дают вес граням соседей, сама не движется), 0 — спит (частицы отложены).
+#ifndef DAMN_WITCHES_WATER_COMMON
+#define DAMN_WITCHES_WATER_COMMON
+
+// 36 байт: каждый проход по частицам упирается в пропускную способность памяти. Состояние не хранится — оно
+// следует из положения (над сеткой — летит, за краем карты — ушла) и состояния плитки (спит — ждёт).
+// Частица в сетке: скорость (берётся с сетки каждый шаг, хранится только для P2G) и аффинная часть APIC C
+// (градиенты компонент скорости, 9 чисел) — в half, 12 чисел в v0–v5. Летящая: скорость во float в v0–v2
+// (её тяжесть копится шаг за шагом), C ей не нужна. Только скалярные поля: на Metal векторы в структурах
+// буфера выравниваются иначе, чем в C#.
+struct Particle
+{
+    float px, py, pz;
+    uint v0, v1, v2, v3, v4, v5;
+};
+
+// Распакованная частица.
+struct ParticleState
+{
+    float3 pos, vel, cx, cy, cz; // cx, cy, cz — градиенты компонент скорости u, v, w
+};
+
+uint PackHalf2(float a, float b) { return f32tof16(a) | (f32tof16(b) << 16); }
+float2 UnpackHalf2(uint v) { return float2(f16tof32(v & 0xFFFFu), f16tof32(v >> 16)); }
+
+float GridTop();
+bool Flying(float3 pos) { return pos.y >= GridTop(); }
+float3 ParticlePos(Particle p) { return float3(p.px, p.py, p.pz); }
+
+ParticleState Unpack(Particle p)
+{
+    ParticleState s;
+    s.pos = ParticlePos(p);
+    if (Flying(s.pos))
+    {
+        s.vel = asfloat(uint3(p.v0, p.v1, p.v2));
+        s.cx = 0; s.cy = 0; s.cz = 0;
+        return s;
+    }
+    float2 a = UnpackHalf2(p.v0), b = UnpackHalf2(p.v1), c = UnpackHalf2(p.v2), d = UnpackHalf2(p.v3),
+           e = UnpackHalf2(p.v4), f = UnpackHalf2(p.v5);
+    s.vel = float3(a, b.x);
+    s.cx = float3(b.y, c);
+    s.cy = float3(d, e.x);
+    s.cz = float3(e.y, f);
+    return s;
+}
+
+Particle Pack(ParticleState s)
+{
+    Particle p;
+    p.px = s.pos.x; p.py = s.pos.y; p.pz = s.pos.z;
+    if (Flying(s.pos))
+    {
+        p.v0 = asuint(s.vel.x); p.v1 = asuint(s.vel.y); p.v2 = asuint(s.vel.z);
+        p.v3 = 0; p.v4 = 0; p.v5 = 0;
+        return p;
+    }
+    p.v0 = PackHalf2(s.vel.x, s.vel.y);
+    p.v1 = PackHalf2(s.vel.z, s.cx.x);
+    p.v2 = PackHalf2(s.cx.y, s.cx.z);
+    p.v3 = PackHalf2(s.cy.x, s.cy.y);
+    p.v4 = PackHalf2(s.cy.z, s.cz.x);
+    p.v5 = PackHalf2(s.cz.y, s.cz.z);
+    return p;
+}
+
+// Только float4: на Metal float3 в структурах буфера выравнивается иначе, чем в C#.
+struct Obstacle
+{
+    float4 aRadius;      // xyz — начало оси капсулы / центр коробки, w — радиус
+    float4 bType;        // xyz — конец оси капсулы, w — тип: 0 капсула/сфера, 1 повёрнутая коробка
+    float4 rotation;     // поворот коробки (кватернион)
+    float4 halfExtents;  // xyz — половина размеров коробки
+    float4 velocity;     // xyz — скорость тела
+    float4 boundsXZ;     // minX, minZ, maxX, maxZ
+};
+
+int W_N;              // столбцов по стороне
+int W_NY;             // ячеек в столбце
+int W_NT;             // плиток по стороне (W_N / 8)
+int W_TileCells;      // ячеек в плитке (64·W_NY)
+int W_TileCount;      // плиток
+float3 W_GridOrigin;  // мировой угол сетки (x, низ, z)
+float W_Cell;
+float W_Gravity;
+// Шаг: меняется каждый кадр, а команды шага записаны один раз — поэтому в буфере. x — dt, y — тел, z — разбудить всё.
+StructuredBuffer<float4> W_StepParams;
+#define W_Dt (W_StepParams[0].x)
+#define W_ObstacleCount ((int)W_StepParams[0].y)
+#define W_WakeAll ((int)W_StepParams[0].z)
+#define W_BedFriction (W_StepParams[0].w)  // g·n² (Маннинг)
+#define W_Correct ((int)W_StepParams[1].x)  // на шаге есть сдвиг поправки плотности
+#define W_StepDt (W_StepParams[1].y)         // весь шаг (W_Dt — подшаг)
+
+StructuredBuffer<int> W_ColBase;    // N×N: первая ячейка столбца (y = 0) или −1 (суша)
+StructuredBuffer<int> W_TileMap;    // NT×NT: номер плитки или −1
+StructuredBuffer<int2> W_TileCoord; // номер плитки → (x, z) плитки
+StructuredBuffer<float> W_Bed;             // высота дна в центрах столбцов
+StructuredBuffer<Obstacle> W_Obstacles;
+
+// Скорость граней. Ядрам, которые её только читают, — без записи (WATER_VEL_READONLY): на Metal ядру доступно
+// не больше 8 буферов на запись, а буфер, объявленный RW, считается таким, даже если ядро его только читает.
+#ifdef WATER_VEL_READONLY
+StructuredBuffer<float> W_VelRO;
+#define W_Vel W_VelRO
+#else
+RWStructuredBuffer<float> W_Vel;
+#endif
+// Тип и доля воды ячеек — так же: перенос частиц их только читает (WATER_CELLS_READONLY).
+#ifdef WATER_CELLS_READONLY
+StructuredBuffer<int> W_TypeRO;
+StructuredBuffer<float> W_DensityRO;
+#define W_Type W_TypeRO
+#define W_Density W_DensityRO
+#else
+RWStructuredBuffer<int> W_Type;       // тип ячейки (у несчитаемых плиток — Solid)
+RWStructuredBuffer<float> W_Density;  // доля воды в ячейке (1 — полна, поверхность — ½)
+#endif
+RWStructuredBuffer<float4> W_SolidVel; // скорость твёрдой ячейки (тела)
+
+// Списки плиток шага (WaterTiles) в одном буфере: список k — с места k·W_TileCount, число — в W_TileCounts[k].
+StructuredBuffer<uint> W_Tiles;
+StructuredBuffer<uint> W_TileCounts;
+int W_ListSlot;
+// Слои плитки, где что-то может меняться: от дна до верхней частицы с запасом (WaterTiles, ядро TileRange).
+StructuredBuffer<int2> W_TileRange;
+
+uint ListTile(uint si) { return W_Tiles[(uint)W_ListSlot * (uint)W_TileCount + si]; }
+
+static const float FixedScale = 65536.0;
+static const int RestCount = 8;      // частиц на ячейку в покое (2×2×2)
+static const int Air = 0;
+static const int Liquid = 1;
+static const int Solid = 2;
+static const int TileColumns = 64;   // столбцов в плитке (8×8)
+static const int3 Neighbours[6] = { int3(1, 0, 0), int3(-1, 0, 0), int3(0, 1, 0), int3(0, -1, 0), int3(0, 0, 1), int3(0, 0, -1) };
+
+// ---------------------------------------------------------------- индексы
+
+int ColumnBase(int i, int k)
+{
+    if (i < 0 || k < 0 || i >= W_N || k >= W_N) return -1;
+    return W_ColBase[k * W_N + i];
+}
+
+// Номер ячейки или −1 (суша, вне сетки).
+int CellIndex(int3 c)
+{
+    if (c.y < 0 || c.y >= W_NY) return -1;
+    int b = ColumnBase(c.x, c.z);
+    return b < 0 ? -1 : b + c.y * TileColumns;
+}
+
+int3 CellCoord(int index)
+{
+    uint t = (uint)index / (uint)W_TileCells;
+    uint local = (uint)index - t * (uint)W_TileCells;
+    int2 tc = W_TileCoord[t];
+    uint col = local & 63u;
+    return int3(tc.x * 8 + (int)(col & 7u), (int)(local >> 6), tc.y * 8 + (int)(col >> 3));
+}
+
+// Плитка столбца (i, k) или −1.
+int TileAt(int i, int k)
+{
+    if (i < 0 || k < 0 || i >= W_N || k >= W_N) return -1;
+    return W_TileMap[(k >> 3) * W_NT + (i >> 3)];
+}
+
+// Плитка столбца (i, k) рядом с телом (TileAwake, запас 4 ячейки): дальше искать ближайшее тело незачем.
+StructuredBuffer<int> W_TileBodyIn;
+bool BodyNear(int i, int k)
+{
+    int t = TileAt(i, k);
+    return t >= 0 && W_TileBodyIn[t] != 0;
+}
+
+// Запуск по списку плиток: номер потока → ячейка плитки из списка, −1 — за концом списка, вне слоёв плитки или суша.
+int ListCell(uint id, out int3 c)
+{
+    c = 0;
+    uint si = id / (uint)W_TileCells;
+    if (si >= W_TileCounts[W_ListSlot]) return -1;
+    uint t = ListTile(si);
+    uint local = id - si * (uint)W_TileCells;
+    int2 range = W_TileRange[t];
+    int y = (int)(local >> 6);
+    if (y < range.x || y > range.y) return -1;
+    int i = (int)(t * (uint)W_TileCells + local);
+    c = CellCoord(i);
+    return CellIndex(c) < 0 ? -1 : i;
+}
+
+float GridTop() { return W_GridOrigin.y + W_NY * W_Cell; }
+
+float3 Axis(int comp) { return float3(comp == 0, comp == 1, comp == 2); }
+float3 CellCenter(int3 c) { return W_GridOrigin + ((float3)c + 0.5) * W_Cell; }
+
+// Грань comp ячейки f — её нижняя по оси сторона; хранится в ячейке f.
+int FaceSlot(int comp, int3 f)
+{
+    int c = CellIndex(f);
+    return c < 0 ? -1 : c * 3 + comp;
+}
+
+float FaceVel(int comp, int3 f)
+{
+    int s = FaceSlot(comp, f);
+    if (s >= 0) return W_Vel[s];
+    // Верх сетки — воздух: скорость как у грани ниже.
+    if (comp == 1 && f.y == W_NY) { s = FaceSlot(1, f - int3(0, 1, 0)); return s >= 0 ? W_Vel[s] : 0; }
+    return 0;
+}
+
+float3 FaceGridCoord(float3 world, int comp)
+{
+    return (world - W_GridOrigin) / W_Cell - 0.5 + 0.5 * Axis(comp);
+}
+
+// ---------------------------------------------------------------- дно и тела
+
+float BedLoad(int2 c) { c = clamp(c, 0, W_N - 1); return W_Bed[c.y * W_N + c.x]; }
+
+float BedHeight(float2 xz)
+{
+    float2 g = (xz - W_GridOrigin.xz) / W_Cell - 0.5;
+    int2 b = (int2)floor(g);
+    float2 f = g - b;
+    return lerp(lerp(BedLoad(b), BedLoad(b + int2(1, 0)), f.x), lerp(BedLoad(b + int2(0, 1)), BedLoad(b + int2(1, 1)), f.x), f.y);
+}
+
+float3 Rotate(float4 q, float3 v)
+{
+    float3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+// Расстояние со знаком до тела (внутри < 0) и наружная нормаль.
+float ObstacleDistance(Obstacle o, float3 p, out float3 normal)
+{
+    normal = float3(0, 1, 0);
+    if (o.bType.w < 0.5)
+    {
+        float3 a = o.aRadius.xyz, b = o.bType.xyz;
+        float3 ab = b - a;
+        float t = saturate(dot(p - a, ab) / max(dot(ab, ab), 1e-8));
+        float3 d = p - (a + ab * t);
+        float len = length(d);
+        normal = len > 1e-6 ? d / len : float3(0, 1, 0);
+        return len - o.aRadius.w;
+    }
+    float4 qi = float4(-o.rotation.xyz, o.rotation.w);
+    float3 local = Rotate(qi, p - o.aRadius.xyz);
+    float3 q = abs(local) - o.halfExtents.xyz;
+    float outside = length(max(q, 0));
+    float inside = min(max(q.x, max(q.y, q.z)), 0);
+    float3 n;
+    if (outside > 0) n = max(q, 0) / outside;
+    else n = q.x > q.y && q.x > q.z ? float3(1, 0, 0) : (q.y > q.z ? float3(0, 1, 0) : float3(0, 0, 1));
+    n *= sign(local + 1e-9);
+    normal = Rotate(o.rotation, n);
+    return outside + inside;
+}
+
+float NearestObstacle(float3 p, out float3 normal, out float3 velocity)
+{
+    float best = 1e9;
+    normal = float3(0, 1, 0);
+    velocity = 0;
+    for (int i = 0; i < W_ObstacleCount; i++)
+    {
+        Obstacle o = W_Obstacles[i];
+        if (p.x < o.boundsXZ.x - W_Cell || p.x > o.boundsXZ.z + W_Cell || p.z < o.boundsXZ.y - W_Cell || p.z > o.boundsXZ.w + W_Cell)
+            continue;
+        float3 n;
+        float d = ObstacleDistance(o, p, n);
+        if (d < best)
+        {
+            best = d;
+            normal = n;
+            velocity = o.velocity.xyz;
+        }
+    }
+    return best;
+}
+
+// Доля ячейки, занятая телами (дно не в счёт — у него эталон RestDensity): по расстоянию до тела в центре.
+float BodyFraction(int3 c)
+{
+    float3 p = CellCenter(c);
+    if (p.y < BedHeight(p.xz)) return 0;
+    float3 n, v;
+    return saturate(0.5 - NearestObstacle(p, n, v) / W_Cell);
+}
+
+int CellType(int3 c)
+{
+    if (c.y >= W_NY) return Air;     // над сеткой — воздух
+    int i = CellIndex(c);
+    return i < 0 ? Solid : W_Type[i];  // суша и низ сетки — стенка
+}
+
+float3 CellSolidVelocity(int3 c)
+{
+    int i = CellIndex(c);
+    return i < 0 ? 0 : W_SolidVel[i].xyz;
+}
+
+
+// Доля воды, которую оценка по весам граней дала бы в этой ячейке, будь вода вокруг полной (WaterGrid.Full, Gather):
+// у дна и у тел ядро захватывает место без частиц, и оценка меньше 1.
+StructuredBuffer<float> W_FullIn;
+
+// Насколько ячейка полна воды: доля по весам граней относительно той, что дала бы здесь полная вода.
+float Fill(int i) { return W_Density[i] / max(W_FullIn[i], 0.05); }
+
+// Свободная поверхность по Гибу: давление равно нулю там, где ячейка заполнена наполовину. Вода — ячейки,
+// заполненные хотя бы наполовину (Classify), поэтому у воды с соседом-воздухом 0 < θ ≤ 1, где
+// θ = (f_c − ½)/(f_c − f_n) — доля расстояния до соседа, которая ещё вода. Нижний предел только против деления на
+// ноль (уровень сдвигается не больше чем на 2% ячейки). Раньше водой была любая ячейка с частицей: у верхней
+// такой ячейки обычно f < ½, θ упиралось в предел, и давление видело уровень с точностью до целой ячейки —
+// разницу высот столбцов меньше ячейки вода не выравнивала, и после волнения поверхность так и оставалась бугристой.
+static const float MinFluidFraction = 0.02;
+
+float FluidFraction(int3 c, int3 n)
+{
+    int ic = CellIndex(c), in_ = CellIndex(n);
+    float rc = ic >= 0 ? Fill(ic) : 1;
+    float rn = in_ >= 0 ? Fill(in_) : 0;
+    return clamp((rc - 0.5) / max(rc - rn, 1e-3), MinFluidFraction, 1.0);
+}
+
+float CellDivergence(int3 c)
+{
+    return (FaceVel(0, c + int3(1, 0, 0)) - FaceVel(0, c)
+          + FaceVel(1, c + int3(0, 1, 0)) - FaceVel(1, c)
+          + FaceVel(2, c + int3(0, 0, 1)) - FaceVel(2, c)) / W_Cell;
+}
+
+// Скорость (и её градиенты, если grad) в точке — трилинейно по граням каждой оси. Все грани лежат в 3×3
+// столбцах вокруг точки: их начала берутся один раз, а не на каждую грань (24 грани на выборку).
+float3 SampleGridImpl(float3 world, bool grad, out float3 gx, out float3 gy, out float3 gz)
+{
+    float3 g0 = (world - W_GridOrigin) / W_Cell;
+    int3 ci = (int3)floor(g0);
+    int cb[9];
+    [unroll] for (int j = 0; j < 9; j++) cb[j] = ColumnBase(ci.x + j % 3 - 1, ci.z + j / 3 - 1);
+    float3 v = 0;
+    gx = 0; gy = 0; gz = 0;
+    [unroll] for (int comp = 0; comp < 3; comp++)
+    {
+        float3 g = g0 - 0.5 + 0.5 * Axis(comp);
+        int3 base = (int3)floor(g);
+        float3 f = g - base;
+        float value = 0;
+        float3 dg = 0;
+        [unroll] for (int k = 0; k < 8; k++)
+        {
+            int3 o = int3(k & 1, (k >> 1) & 1, k >> 2);
+            int3 face = base + o;
+            int col = cb[(face.z - ci.z + 1) * 3 + (face.x - ci.x + 1)];
+            int y = face.y;
+            if (comp == 1 && y == W_NY) y = W_NY - 1; // верх сетки — воздух: скорость как у грани ниже
+            float u = col >= 0 && y >= 0 && y < W_NY ? W_Vel[(col + y * TileColumns) * 3 + comp] : 0;
+            float3 wv = lerp(1 - f, f, (float3)o);
+            value += wv.x * wv.y * wv.z * u;
+            if (grad)
+            {
+                float3 sgn = (float3)o * 2 - 1;
+                dg += float3(sgn.x * wv.y * wv.z, wv.x * sgn.y * wv.z, wv.x * wv.y * sgn.z) * u / W_Cell;
+            }
+        }
+        v += Axis(comp) * value;
+        if (comp == 0) gx = dg; else if (comp == 1) gy = dg; else gz = dg;
+    }
+    return v;
+}
+
+float3 SampleGrid(float3 world, out float3 gx, out float3 gy, out float3 gz) { return SampleGridImpl(world, true, gx, gy, gz); }
+
+float3 SampleGrid(float3 world)
+{
+    float3 a, b, c;
+    return SampleGridImpl(world, false, a, b, c);
+}
+
+bool InsideGrid(float3 world)
+{
+    int3 c = (int3)floor((world - W_GridOrigin) / W_Cell);
+    return CellIndex(c) >= 0;
+}
+
+uint Hash(uint x)
+{
+    uint state = x * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+#endif

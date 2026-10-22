@@ -1,0 +1,52 @@
+// Пузыри белой воды: размер и время жизни (рождение — WaterParticles.compute, отрисовка — WaterWhitewater.shader).
+//  - Размер: захваченный воздух дробится турбулентностью; пузыри крупнее масштаба Хинце (~1 мм) распределены как
+//    R^(−10/3) (Deane & Stokes 2002, Nature 418) — крупных мало. Частица белой воды — пузырь (крупный) или пятно
+//    мелких пузырей (мельче BubbleSingle); радиус — её видимый размер.
+//  - Жизнь: пузырь на поверхности лопается в случайный миг — плёнка утончается (стекает), прорывает её случайное
+//    возмущение. Время жизни распределено по Вейбуллу с показателем 4/3, среднее растёт как √R (Poulain, Villermaux &
+//    Bourouiba 2018, JFM 851; обзор: «The Life of a Surface Bubble», Molecules 26, 2021): мелкие лопаются раньше.
+//    В водопроводной и речной воде среднее 2.2–3.9 с (Zheng et al.).
+//    Крупный пузырь живёт своё случайное время и лопается целиком; пятно мелких тает: его объём — доля ещё не
+//    лопнувших пузырей exp(−(t/t0)^β), оно исчезает, когда их остаётся BubbleSurvivalEnd.
+#ifndef DAMN_WITCHES_WATER_BUBBLES
+#define DAMN_WITCHES_WATER_BUBBLES
+
+static const float BubbleRMin = 0.006;
+static const float BubbleRMax = 0.03;
+static const float BubbleSingle = 0.015;      // крупнее — отдельный пузырь (прозрачная плёнка), мельче — белое пятно
+static const float BubbleWeibull = 4.0 / 3.0;
+static const float BubbleSurvivalEnd = 0.05;
+
+float W_BubbleLife; // средняя жизнь пузыря радиусом 1 см, с
+
+// Глубина, на которую вода, падающая со скоростью v (струя, тело толщиной d), уносит пузыри: у падающих струй
+// Hp ≈ 2.6·(v·d)^0.7, м (McKeogh & Ervine 1981). Пузыри рождаются по всей этой глубине и всплывают — у поверхности
+// они проявляются из мутной воды постепенно, а не появляются готовыми.
+float PlumeDepth(float v, float d) { return 2.6 * pow(max(v * d, 0), 0.7); }
+
+// Масштаб Вейбулла t0 = ⟨t⟩ / Γ(1 + 1/β), Γ(1.75) = 0.919.
+float BubbleScale(float r) { return W_BubbleLife * sqrt(r / 0.01) / 0.919; }
+
+// Радиус по равномерному u ∈ [0, 1): обратная функция распределения R^(−10/3) на [BubbleRMin, BubbleRMax].
+float BubbleRadius(float u)
+{
+    const float a = 1.0 - 10.0 / 3.0;
+    return pow(lerp(pow(BubbleRMin, a), pow(BubbleRMax, a), u), 1.0 / a);
+}
+
+// Жизнь при рождении: пузырю — случайная по Вейбуллу (u ∈ (0, 1]), пятну — пока не останется BubbleSurvivalEnd.
+float BubbleLife(float r, float u)
+{
+    float p = r >= BubbleSingle ? -log(max(u, 1e-6)) : -log(BubbleSurvivalEnd);
+    return BubbleScale(r) * pow(p, 1.0 / BubbleWeibull);
+}
+
+// Доля ещё не лопнувших пузырей пятна, которому осталось жить life.
+float BubbleSurvival(float r, float life)
+{
+    float t0 = BubbleScale(r);
+    float age = max(BubbleLife(r, 1) - life, 0);
+    return exp(-pow(age / t0, BubbleWeibull));
+}
+
+#endif

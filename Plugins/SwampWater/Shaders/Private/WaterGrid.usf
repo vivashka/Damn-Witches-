@@ -1,0 +1,425 @@
+#include "/Engine/Public/Platform.ush"
+// Сетка воды: скорость граней из P2G, доля воды, типы ячеек (вода, воздух, дно и тела), скорость твёрдых
+// граней, правая часть давления, проекция, продолжение скорости в воздух, начальное давление.
+// Шаговые ядра идут по спискам плиток (WaterTiles): считаемые, а твёрдые грани — ещё и по кайме.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include "/Plugin/SwampWater/Private/WaterCommon.ush"
+
+float W_InitLevel;
+RWStructuredBuffer<int> W_Mom;
+RWStructuredBuffer<int> W_Wgt;
+RWStructuredBuffer<int> W_FaceSolid;
+RWStructuredBuffer<int> W_ValidIn;
+RWStructuredBuffer<int> W_ValidOut;
+RWStructuredBuffer<uint> W_CellStart; // начала ключей внутри плитки (сортировка частиц)
+RWStructuredBuffer<float> W_Rhs;
+RWStructuredBuffer<float> W_Diag;
+RWStructuredBuffer<uint> W_Mask;
+RWStructuredBuffer<float> W_P;        // φ = p/ρ, м²/с²
+RWStructuredBuffer<uint> W_Stats;
+RWStructuredBuffer<float> W_RestDensity; // доля воды в покое (RecordRest)
+RWStructuredBuffer<float> W_FullOut;     // доля полной воды (Gather → Fill)
+RWStructuredBuffer<float> W_BodyFrac;    // доля ячейки, занятая телами (BodyCells)
+StructuredBuffer<float> W_BodyFracIn;
+
+Texture2D<float4> W_SurfaceIn; // поверхность столбцов прошлого шага: (уровень, глубина или −1, средняя скорость x, z)
+
+// Трение о дно по Маннингу: τ = ρ·g·n²·|U|·U / h^(1/3) на единицу площади дна (U — средняя по глубине скорость,
+// h — глубина). Сила дна распределена по столбцу (мелкая вода перемешана по глубине): du/dt = −g·n²·|U|·u / h^(4/3).
+// Неявно (скорость не меняет знак за шаг): u / (1 + dt·g·n²·|U| / h^(4/3)). Для грани — среднее двух столбцов.
+float BedDamping(int2 a, int2 b)
+{
+    float4 sa = W_SurfaceIn[a], sb = W_SurfaceIn[b];
+    float wa = sa.y > 0 ? 1 : 0, wb = sb.y > 0 ? 1 : 0;
+    if (wa + wb == 0) return 1;
+    float h = (wa * sa.y + wb * sb.y) / (wa + wb);
+    float2 u = (wa * sa.zw + wb * sb.zw) / (wa + wb);
+    return 1.0 / (1.0 + W_Dt * W_BedFriction * length(u) / pow(max(h, 1e-3), 4.0 / 3.0));
+}
+
+// Доля ячейки, занятая телами, — один раз на ячейку (Gather берёт её у 18 соседей каждой грани). Считаемые плитки и
+// кайма: грани у края плитки захватывают ячейки каймы. Только плитки у тел (BodyNear): Gather читает доли лишь у
+// ячеек не дальше 2.5 ячейки от тела, а их соседи всегда в плитках у тела (запас плитки — 4 ячейки).
+// В счёт идёт только часть тела ниже уровня воды (прошлого шага): частиц недостаёт лишь там, где вода была бы.
+// Тело над водой (верх куба, нога на мели) иначе раздувало долю воды у кромки — вокруг тела стоял горб в 3–5 см.
+[numthreads(64, 1, 1)]
+void BodyCells(uint3 id : SV_DispatchThreadID)
+{
+    int3 c;
+    int i = ListCell(id.x, c);
+    if (i < 0 || !BodyNear(c.x, c.z)) return;
+    float4 s = W_SurfaceIn[clamp(c.xz, 0, W_N - 1)];
+    float bottom = W_GridOrigin.y + c.y * W_Cell;
+    float wet = s.y >= 0 ? saturate((s.x - bottom) / W_Cell) : 0;
+    W_BodyFrac[i] = BodyFraction(c) * wet;
+}
+
+float BodyFracAt(int3 c)
+{
+    int i = CellIndex(c);
+    return i < 0 ? 0 : W_BodyFracIn[i];
+}
+
+// Доля веса грани (нижней по оси comp ячейки c), приходящаяся на тела вокруг: столько недодаст грани полная вода,
+// ведь в теле частиц нет. Ядро грани: по своей оси две ячейки по ½, по другим — три ячейки 1/8, 3/4, 1/8 (интеграл
+// трилинейного ядра по ячейке).
+float BodyFaceWeight(int3 c, int comp)
+{
+    static const float side[3] = { 0.125, 0.75, 0.125 };
+    float w = 0;
+    for (int a = 0; a < 2; a++)
+    for (int j = 0; j < 3; j++)
+    for (int k = 0; k < 3; k++)
+    {
+        int3 o = comp == 0 ? int3(a - 1, j - 1, k - 1) : (comp == 1 ? int3(j - 1, a - 1, k - 1) : int3(j - 1, k - 1, a - 1));
+        w += 0.5 * side[j] * side[k] * BodyFracAt(c + o);
+    }
+    return w;
+}
+
+// Скорость граней ячейки — импульс / вес + тяжесть, у горизонтальных — трение о дно. Доля воды в ячейке —
+// средний вес её граней (Σ трилинейных весов частиц) к весу полной ячейки RestCount: отдельно раздавать частицы в
+// центры не нужно. Внутри тел частиц нет, и у тела ячейки воды недосчитываются (ядро захватывает тело) — вода там
+// казалась полупустой, поверхность у тела проседала ямкой. Поэтому здесь же — сколько дала бы полная вода (W_FullOut):
+// доля покоя у дна (RestDensity) за вычетом доли ядра, что приходится на тела. Добавлять телу «воду» к весу нельзя:
+// часть тела над водой (нога на мели, верх куба) тогда окружала себя несуществующей водой.
+[numthreads(64, 1, 1)]
+void Gather(uint3 id : SV_DispatchThreadID)
+{
+    int3 c;
+    int i = ListCell(id.x, c);
+    if (i < 0) return;
+    int2 last = W_N - 1;
+    float dampX = BedDamping(clamp(c.xz - int2(1, 0), 0, last), c.xz);
+    float dampZ = BedDamping(clamp(c.xz - int2(0, 1), 0, last), c.xz);
+    float sum = 0;
+    int faces = 0;
+    float3 pn, pv;
+    bool nearBody = BodyNear(c.x, c.z) && NearestObstacle(CellCenter(c), pn, pv) < 2.5 * W_Cell;
+    float body = 0;
+    for (int comp = 0; comp < 3; comp++)
+    {
+        int s = i * 3 + comp;
+        int w = W_Wgt[s];
+        float v = w > 0 ? (float)W_Mom[s] / (float)w : 0.0;
+        if (comp == 1 && w > 0) v -= W_Gravity * W_Dt;
+        if (comp == 0) v *= dampX;
+        if (comp == 2) v *= dampZ;
+        W_Vel[s] = v;
+        W_ValidIn[s] = w > 0 ? 1 : 0;
+        int hi = FaceSlot(comp, c + int3(Axis(comp)));
+        sum += w;
+        faces++;
+        if (hi >= 0) { sum += W_Wgt[hi]; faces++; }
+        [branch] if (nearBody)
+        {
+            body += BodyFaceWeight(c, comp);
+            if (hi >= 0) body += BodyFaceWeight(c + int3(Axis(comp)), comp);
+        }
+    }
+    W_Density[i] = sum / (faces * FixedScale * RestCount);
+    W_FullOut[i] = W_RestDensity[i] * max(1.0 - body / faces, 0.25);
+}
+
+[numthreads(64, 1, 1)]
+void Classify(uint3 id : SV_DispatchThreadID)
+{
+    int3 c;
+    int i = ListCell(id.x, c);
+    if (i < 0) return;
+    float3 p = CellCenter(c);
+    // Вода — где ячейка заполнена хотя бы наполовину (там, по Гибу, проходит поверхность). Ячейка с редкими
+    // частицами над поверхностью — воздух: давление в ней ноль, скорость продолжается из воды.
+    int type = Fill(i) >= 0.5 ? Liquid : Air;
+    float4 solid = 0;
+    if (p.y < BedHeight(p.xz))
+    {
+        type = Solid;
+    }
+    else
+    {
+        float3 n, v;
+        if (NearestObstacle(p, n, v) < 0)
+        {
+            type = Solid;
+            solid = float4(v, 1);
+        }
+    }
+    W_Type[i] = type;
+    W_SolidVel[i] = solid;
+    if (type != Liquid) W_P[i] = 0;
+}
+
+// Грани у твёрдого (дно, тела, несчитаемые плитки) — скорость твёрдого. Идёт по считаемым плиткам и кайме:
+// грани между ними хранит ячейка каймы.
+[numthreads(64, 1, 1)]
+void FaceBoundary(uint3 id : SV_DispatchThreadID)
+{
+    int3 b;
+    int i = ListCell(id.x, b);
+    if (i < 0) return;
+    int tb = CellType(b);
+    float3 bn, bv;
+    bool nearBody = BodyNear(b.x, b.z) && NearestObstacle(CellCenter(b), bn, bv) < 1.5 * W_Cell; // грани — в полуячейке от центра
+    for (int comp = 0; comp < 3; comp++)
+    {
+        int s = i * 3 + comp;
+        int3 a = b - int3(Axis(comp));
+        int ta = CellType(a);
+        if (ta == Solid || tb == Solid)
+        {
+            float3 v = ta == Solid && tb == Solid ? 0.5 * (CellSolidVelocity(a) + CellSolidVelocity(b))
+                : (ta == Solid ? CellSolidVelocity(a) : CellSolidVelocity(b));
+            W_Vel[s] = v[comp];
+            W_FaceSolid[s] = 1;
+            W_ValidIn[s] = 1;
+        }
+        else
+        {
+            W_FaceSolid[s] = 0;
+            // Тело тоньше ячейки (нога, рука) или край тела не накрывают центр ячейки, и стенкой сетка их не видит.
+            // Погружённая граница (direct forcing, Mohd-Yusof 1997): грань, частью закрытая телом, получает скорость
+            // тела в доле закрытого, давление затем раздвигает воду. Доля — по расстоянию до тела в центре грани.
+            // Только поперёк стенки (× |n·ось|): вода без вязкости скользит вдоль тела, как и у стенок-ячеек. С
+            // полным прилипанием вода у борта ходила вверх-вниз вместе с кубом, Архимед видел этот уровень, и куб
+            // качался без конца.
+            [branch] if (nearBody && (ta == Liquid || tb == Liquid))
+            {
+                float3 axis = float3(Axis(comp));
+                float3 n, v;
+                float d = NearestObstacle(CellCenter(b) - 0.5 * W_Cell * axis, n, v);
+                float covered = saturate(0.5 - d / W_Cell) * abs(dot(n, axis));
+                if (covered > 0) W_Vel[s] = lerp(W_Vel[s], dot(v, axis), covered);
+            }
+        }
+    }
+}
+
+// Правая часть (и коэффициенты давления): φ = p/ρ, новая скорость u − dt·∇φ бездивергентна:
+// Σ_n(φ_c − φ_n)/h² по нетвёрдым соседям = −div/dt (в воздухе φ = 0, у твёрдых граней ∂φ/∂n = 0).
+[numthreads(64, 1, 1)]
+void Divergence(uint3 id : SV_DispatchThreadID)
+{
+    int3 c;
+    int i = ListCell(id.x, c);
+    if (i < 0) return;
+    int type = W_Type[i];
+    W_Rhs[i] = type == Liquid ? -CellDivergence(c) / W_Dt : 0;
+    // Коэффициенты давления мелкого уровня (WaterPressure): диагональ и соседи-вода; у воздуха — ghost fluid.
+    float diag = 0;
+    uint mask = (uint)type << 6;
+    if (type == Liquid)
+    {
+        for (int k = 0; k < 6; k++)
+        {
+            int3 n = c + Neighbours[k];
+            int tn = CellType(n);
+            if (tn == Solid) continue;
+            if (tn == Air) { diag += 1.0 / FluidFraction(c, n); continue; }
+            diag += 1.0;
+            mask |= 1u << k;
+        }
+    }
+    W_Diag[i] = diag;
+    W_Mask[i] = mask;
+}
+
+float CellPressure(int3 c)
+{
+    if (CellType(c) != Liquid) return 0;
+    return W_P[CellIndex(c)];
+}
+
+[numthreads(64, 1, 1)]
+void Project(uint3 id : SV_DispatchThreadID)
+{
+    int3 b;
+    int i = ListCell(id.x, b);
+    if (i < 0) return;
+    int tb = CellType(b);
+    for (int comp = 0; comp < 3; comp++)
+    {
+        int s = i * 3 + comp;
+        if (W_FaceSolid[s] == 1) continue;
+        int3 a = b - int3(Axis(comp));
+        int ta = CellType(a);
+        if (ta == Liquid || tb == Liquid)
+        {
+            // Грань вода–воздух: ноль давления на поверхности, на расстоянии θ·h от центра водной ячейки.
+            float theta = 1;
+            if (ta == Air) theta = FluidFraction(b, a);
+            else if (tb == Air) theta = FluidFraction(a, b);
+            W_Vel[s] -= W_Dt * (CellPressure(b) - CellPressure(a)) / (W_Cell * theta);
+            W_ValidIn[s] = 1;
+        }
+        else
+        {
+            W_ValidIn[s] = 0;
+        }
+    }
+}
+
+// Поправка плотности (Kugelstadt et al. 2019, «Implicit density projection for volume conserving liquids»).
+// Сетка бездивергентна, но скорость, интерполированная в частицы, — лишь приближённо: частицы сбиваются в сгустки
+// или расходятся (перемешанная вода разрежена на 5–15 % и стоит выше покоя, объём столбцов неровен). Несжимаемость —
+// это и плотность частиц: сдвиг частиц Δx = −∇ψ, ∇·Δx = ρ − 1, т. е. Σ(ψc − ψn)/h² = ρ − 1 — то же уравнение,
+// что у давления (решает тот же мультигрид), на поверхности ψ = 0. Сдвигаются только позиции (энергии нет).
+// Внутри — в обе стороны, к единице: разрежение внутри (решение общее) опускает поверхность. У поверхности и у тел
+// доля меньше единицы законна (ячейка заполнена частично) — только сжатие. У дна оценка доли по весам граней
+// смещена (ячейка срезана дном): сравнивается с долей покоя, замеренной после заливки (RecordRest), в обе стороны.
+// Сравнение с геометрической долей над дном толкало частицы от дна, выталкивание возвращало — поднятая масса
+// падала, и вода разгонялась без конца. Правая часть — в W_Rhs (давление уже решено), ψ с нуля.
+RWStructuredBuffer<float> W_Corr;     // ψ, м²
+
+[numthreads(64, 1, 1)]
+void CorrectionRhs(uint3 id : SV_DispatchThreadID)
+{
+    int3 c;
+    int i = ListCell(id.x, c);
+    if (i < 0) return;
+    W_Corr[i] = 0;
+    if (W_Type[i] != Liquid) { W_Rhs[i] = 0; return; }
+    bool air = false, bed = false, body = false;
+    for (int k = 0; k < 6; k++)
+    {
+        int3 n = c + Neighbours[k];
+        int t = CellType(n);
+        if (t == Air) air = true;
+        else if (t == Solid)
+        {
+            float3 q = CellCenter(n);
+            if (q.y < BedHeight(q.xz)) bed = true; else body = true;
+        }
+    }
+    // Внешний слой — и ячейка под ячейкой поверхности: её верхняя грань наполовину в той, полупустой (ядро весов),
+    // и оценка здесь занижена (particle deficiency, Kugelstadt et al.). Иначе, пока ячейка поверхности мигала
+    // вода/воздух (доля около ½), эта то тянула частицы вниз, то нет, — вода в покое не засыпала.
+    if (CellType(c + int3(0, 2, 0)) == Air) air = true;
+    float rho = W_Density[i];
+    float e;
+    if (air || body) e = max(rho - 1.0, 0.0);  // поверхность, тело, стенка спящей воды — только сжатие
+    else if (bed) e = rho - W_RestDensity[i];   // у дна — к доле покоя при этой геометрии дна
+    else e = rho - 1.0;
+    W_Rhs[i] = e;
+}
+
+// Доля воды в покое (сразу после заливки: частицы ровно, вода стоит) — эталон для ячеек у дна: оценка по весам
+// граней в срезанной дном ячейке смещена, и сравнивать её надо с тем, что она же даёт для правильной воды. Остальные
+// ячейки (и у дна выше стартового уровня) — 1.
+[numthreads(64, 1, 1)]
+void RecordRest(uint3 id : SV_DispatchThreadID)
+{
+    int3 c;
+    int i = ListCell(id.x, c);
+    if (i < 0) return;
+    bool bed = false;
+    for (int k = 0; k < 6; k++)
+    {
+        float3 q = CellCenter(c + Neighbours[k]);
+        if (q.y < BedHeight(q.xz)) bed = true;
+    }
+    W_RestDensity[i] = bed && CellCenter(c).y + 0.5 * W_Cell <= W_InitLevel ? W_Density[i] : 1.0;
+}
+
+float CorrAt(int3 c)
+{
+    if (CellType(c) != Liquid) return 0;
+    return W_Corr[CellIndex(c)];
+}
+
+// Сдвиг на гранях −∇ψ (у воздуха — ghost fluid, как у давления), в W_Mom (биты float): накопитель P2G до следующей
+// раскладки свободен. Идёт по считаемым и кайме: у каймы ячейки — стенка, сдвиг через них ноль.
+[numthreads(64, 1, 1)]
+void CorrectionFaces(uint3 id : SV_DispatchThreadID)
+{
+    int3 b;
+    int i = ListCell(id.x, b);
+    if (i < 0) return;
+    int tb = CellType(b);
+    for (int comp = 0; comp < 3; comp++)
+    {
+        int3 a = b - int3(Axis(comp));
+        int ta = CellType(a);
+        float d = 0;
+        if (ta != Solid && tb != Solid && (ta == Liquid || tb == Liquid))
+        {
+            float theta = 1;
+            if (ta == Air) theta = FluidFraction(b, a);
+            else if (tb == Air) theta = FluidFraction(a, b);
+            d = -(CorrAt(b) - CorrAt(a)) / (W_Cell * theta);
+        }
+        W_Mom[i * 3 + comp] = asint(d);
+    }
+}
+
+// Скорость продолжается в воздух средним по известным соседним граням той же оси.
+[numthreads(64, 1, 1)]
+void Extrapolate(uint3 id : SV_DispatchThreadID)
+{
+    int3 f;
+    int i = ListCell(id.x, f);
+    if (i < 0) return;
+    for (int comp = 0; comp < 3; comp++)
+    {
+        int s = i * 3 + comp;
+        if (W_ValidIn[s] == 1) { W_ValidOut[s] = 1; continue; }
+        float sum = 0;
+        int count = 0;
+        for (int k = 0; k < 6; k++)
+        {
+            int j = FaceSlot(comp, f + Neighbours[k]);
+            if (j >= 0 && W_ValidIn[j] == 1)
+            {
+                sum += W_Vel[j];
+                count++;
+            }
+        }
+        if (count > 0)
+        {
+            W_Vel[s] = sum / count;
+            W_ValidOut[s] = 1;
+        }
+        else
+        {
+            W_ValidOut[s] = 0;
+        }
+    }
+}
+
+// Начальное давление — гидростатика: φ = g·(уровень − y).
+[numthreads(64, 1, 1)]
+void InitPressure(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= W_TileCount * W_TileCells) return;
+    float3 p = CellCenter(CellCoord(i));
+    W_P[i] = p.y >= BedHeight(p.xz) ? max(0.0, W_Gravity * (W_InitLevel - p.y)) : 0;
+}
+
+// Отладка: [1] — макс. остаточная дивергенция ×1000, [2] — водных ячеек, [3] — сумма квадратов ×10⁴.
+[numthreads(64, 1, 1)]
+void Measure(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= W_TileCount * W_TileCells) return;
+    int3 c = CellCoord(i);
+    if (CellIndex(c) < 0 || W_Type[i] != Liquid) return;
+    float div = CellDivergence(c);
+    InterlockedMax(W_Stats[1], (uint)(abs(div) * 1000.0));
+    InterlockedAdd(W_Stats[2], 1u);
+    InterlockedAdd(W_Stats[3], (uint)min(div * div * 1e4, 1e5));
+}
+

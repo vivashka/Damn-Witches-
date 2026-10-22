@@ -1,0 +1,87 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Category": "",
+	"Description": "",
+	"Modules": [
+		{
+			"Name": "DamnWitches",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"AdditionalDependencies": [
+				"Engine",
+				"AIModule",
+				"UMG"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "ModelingToolsEditorMode",
+			"Enabled": true,
+			"TargetAllowList": [
+				"Editor"
+			]
+		},
+		{
+			"Name": "StateTree",
+			"Enabled": true
+		},
+		{
+			"Name": "GameplayStateTree",
+			"Enabled": true
+		},
+		{
+			"Name": "ModelContextProtocol",
+			"Enabled": true
+		},
+		{
+			"Name": "MCPClientToolset",
+			"Enabled": true
+		},
+		{
+			"Name": "EditorToolset",
+			"Enabled": true
+		},
+		{
+			"Name": "PCGToolset",
+			"Enabled": true
+		},
+		{
+			"Name": "PCGBiomeCore",
+			"Enabled": true
+		},
+		{
+			"Name": "PCGBiomeSample",
+			"Enabled": true
+		},
+		{
+			"Name": "PCGPrimitives",
+			"Enabled": true
+		},
+		{
+			"Name": "PCGPrimitives_MeshPartitionInterop",
+			"Enabled": true
+		},
+		{
+			"Name": "AnimationAssistantToolset",
+			"Enabled": true
+		},
+		{
+			"Name": "DataRegistry",
+			"Enabled": true
+		},
+		{
+			"Name": "DataRegistryToolset",
+			"Enabled": true
+		},
+		{
+			"Name": "MVVMToolset",
+			"Enabled": true
+		},
+		{
+			"Name": "SwampWater",
+			"Enabled": true
+		}
+	]
+}

@@ -1,0 +1,218 @@
+#include "/Engine/Public/Platform.ush"
+// Спящая вода: какие плитки (8×8 столбцов) считать на этом шаге.
+// Плитка «бодрствует», если за прошлый шаг в неё пришла частица быстрее W_SleepSpeed или над ней движется тело.
+// Считаются плитки не дальше одной от бодрствующей (состояние 2), следующее кольцо — кайма (1): её частицы
+// дают вес граням считаемых ячеек, сама она стоит. Остальные спят (0): их частицы отложены, для считаемой воды
+// это неподвижная стенка — так и есть, вода там в покое. Волна не успевает пересечь плитку за шаг, поэтому
+// просыпается раньше, чем доходит до стенки.
+
+
+
+
+
+
+
+
+#include "/Plugin/SwampWater/Private/WaterCommon.ush"
+
+float W_SleepSpeed;
+// Вода считается только в радиусе от игрока (м, 0 — вся): дальние плитки спят, их просьба проснуться ждёт,
+// пока игрок не подойдёт. Центр — W_StepParams[1].zw (x, z).
+float W_SimRadius;
+int W_Block1;  // ячеек плитки на уровнях мультигрида 1–3
+int W_Block2;
+int W_Block3;
+
+RWStructuredBuffer<uint> W_TileWake;   // за прошлый шаг: пришла быстрая частица или сирота
+#define W_TileAwakeIn W_TileAwake
+RWStructuredBuffer<int> W_TileAwake;
+RWStructuredBuffer<int> W_TileBody;    // рядом с плиткой (4 ячейки) есть тело — для BodyNear
+RWStructuredBuffer<int> W_TileState;
+RWStructuredBuffer<int> W_TileSlot;    // место плитки среди считаемых и каймы (ключи сортировки) или −1
+RWStructuredBuffer<uint> W_FrozenCount;
+StructuredBuffer<uint> W_FrozenCap;
+StructuredBuffer<uint> W_TileTotal;    // частиц в плитке по прошлой сортировке
+// Списки (по W_TileCount мест): 0 — считаемые, 1 — считаемые и кайма (по месту), 2 — проснувшиеся (их частицы
+// вернуть из отложенных), 3 — переставшие считаться (их ячейки — снова стенка).
+RWStructuredBuffer<uint> W_Lists;
+RWStructuredBuffer<int> W_SimIndex;    // место плитки в списке считаемых или −1
+RWStructuredBuffer<uint> W_Counts;     // [0] считаемых, [1] с каймой, [2] проснувшихся, [3] переставших
+RWBuffer<uint> W_Args;       // аргументы непрямых запусков (по 3 числа)
+
+// Частиц может прийти в плитку за шаг, пока она засыпает: только медленные (быстрая разбудила бы), их немного.
+static const uint FrozenMargin = 64;
+
+int TileAtTile(int2 tc)
+{
+    if (any(tc < 0) || any(tc >= W_NT)) return -1;
+    return W_TileMap[tc.y * W_NT + tc.x];
+}
+
+[numthreads(64, 1, 1)]
+void TileAwake(uint3 id : SV_DispatchThreadID)
+{
+    int t = (int)id.x;
+    if (t == 0)
+    {
+        W_Counts[0] = 0; W_Counts[1] = 0; W_Counts[2] = 0; W_Counts[3] = 0;
+    }
+    if (t >= W_TileCount) return;
+    int2 tcr = W_TileCoord[t];
+    float2 tileCenter = W_GridOrigin.xz + ((float2)(tcr * 8) + 4.0) * W_Cell;
+    bool inRange = W_SimRadius <= 0 || distance(tileCenter, W_StepParams[1].zw) < W_SimRadius;
+    bool awake = W_WakeAll != 0 || W_TileWake[t] != 0;
+    if (inRange) W_TileWake[t] = 0;
+
+    // Плитке не хватит места, чтобы уснуть, — считается дальше.
+    if (W_TileSlot[t] >= 0 && W_TileTotal[t] + FrozenMargin > W_FrozenCap[t]) awake = true;
+
+    // Движущееся тело над плиткой (с запасом в ячейку); любое тело в 4 ячейках от плитки — для BodyNear.
+    int2 tc = W_TileCoord[t];
+    float2 lo = W_GridOrigin.xz + (float2)(tc * 8) * W_Cell - W_Cell, hi = lo + 10.0 * W_Cell;
+    float2 nearLo = lo - 3.0 * W_Cell, nearHi = hi + 3.0 * W_Cell;
+    float top = W_GridOrigin.y + W_NY * W_Cell;
+    bool body = false;
+    for (int i = 0; i < W_ObstacleCount; i++)
+    {
+        Obstacle o = W_Obstacles[i];
+        float bottom = o.bType.w < 0.5 ? min(o.aRadius.y, o.bType.y) - o.aRadius.w : o.aRadius.y - length(o.halfExtents.xyz);
+        if (bottom >= top) continue;
+        if (o.boundsXZ.z < nearLo.x || o.boundsXZ.x > nearHi.x || o.boundsXZ.w < nearLo.y || o.boundsXZ.y > nearHi.y) continue;
+        body = true;
+        if (length(o.velocity.xyz) <= W_SleepSpeed) continue;
+        if (o.boundsXZ.z < lo.x || o.boundsXZ.x > hi.x || o.boundsXZ.w < lo.y || o.boundsXZ.y > hi.y) continue;
+        awake = true;
+    }
+    if (!inRange && !(W_TileSlot[t] >= 0 && W_TileTotal[t] + FrozenMargin > W_FrozenCap[t])) awake = false;
+    W_TileAwake[t] = awake ? 1 : 0;
+    W_TileBody[t] = body ? 1 : 0;
+}
+
+[numthreads(64, 1, 1)]
+void TileState(uint3 id : SV_DispatchThreadID)
+{
+    int t = (int)id.x;
+    if (t >= W_TileCount) return;
+    int2 tc = W_TileCoord[t];
+    int dist = 3;
+    for (int dz = -2; dz <= 2; dz++)
+    for (int dx = -2; dx <= 2; dx++)
+    {
+        int n = TileAtTile(tc + int2(dx, dz));
+        if (n >= 0 && W_TileAwakeIn[n] != 0) dist = min(dist, max(abs(dx), abs(dz)));
+    }
+    int state = dist <= 1 ? 2 : (dist == 2 ? 1 : 0);
+    int old = W_TileState[t];
+    W_TileState[t] = state;
+
+    uint slot = 0xFFFFFFFFu;
+    if (state > 0)
+    {
+        InterlockedAdd(W_Counts[1], 1u, slot);
+        W_Lists[(uint)W_TileCount + slot] = (uint)t;
+    }
+    W_TileSlot[t] = (int)slot;
+    uint k;
+    int si = -1;
+    if (state == 2)
+    {
+        InterlockedAdd(W_Counts[0], 1u, k);
+        W_Lists[k] = (uint)t;
+        si = (int)k;
+    }
+    W_SimIndex[t] = si;
+    if (old == 0 && state > 0)
+    {
+        InterlockedAdd(W_Counts[2], 1u, k);
+        W_Lists[2u * (uint)W_TileCount + k] = (uint)t;
+    }
+    if (old == 2 && state != 2)
+    {
+        InterlockedAdd(W_Counts[3], 1u, k);
+        W_Lists[3u * (uint)W_TileCount + k] = (uint)t;
+    }
+    if (old > 0 && state == 0) W_FrozenCount[t] = 0; // частицы отложит сортировка
+}
+
+void SetArgs(uint index, uint groups)
+{
+    W_Args[index * 3] = max(groups, 1u);
+    W_Args[index * 3 + 1] = 1;
+    W_Args[index * 3 + 2] = 1;
+}
+
+uint Div(uint a, uint b) { return (a + b - 1u) / b; }
+
+// Индексы аргументов — WaterTiles.Arg*.
+[numthreads(1, 1, 1)]
+void TileArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint sim = W_Counts[0], d = W_Counts[1];
+    uint tc = (uint)W_TileCells;
+    SetArgs(0, Div(sim * tc, 64u));
+    SetArgs(1, Div(d * tc, 64u));
+    SetArgs(2, W_Counts[2]);
+    SetArgs(3, W_Counts[3]);
+    SetArgs(4, Div(sim * (uint)W_Block1, 64u));
+    SetArgs(5, Div(sim * (uint)W_Block2, 64u));
+    SetArgs(6, Div(sim * (uint)W_Block3, 64u));
+    SetArgs(7, d);
+    SetArgs(13, sim);
+    SetArgs(14, d * 9u);
+    SetArgs(15, Div(d, 64u));
+}
+
+// Плитка перестала считаться: её ячейки уровня — стенка без скорости (для соседей она стоит).
+int W_RetireBlock;
+int W_RetireVelocity;
+RWStructuredBuffer<int> W_RetireType;
+
+[numthreads(64, 1, 1)]
+void Retire(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    if (group.x >= W_TileCounts[W_ListSlot]) return;
+    uint t = ListTile(group.x);
+    for (uint i = gi; i < (uint)W_RetireBlock; i += 64u)
+    {
+        uint c = t * (uint)W_RetireBlock + i;
+        W_RetireType[c] = Solid;
+        if (W_RetireVelocity != 0) W_SolidVel[c] = 0;
+    }
+}
+
+// Слои плитки на шаг: от дна (ниже — дно во всех столбцах) до верхней частицы этого или прошлого шага (чтобы
+// очистить то, откуда вода ушла) плюс запас: продолжение скорости в воздух (3 ячейки), вес граней (1) и подъём
+// воды за шаг (не больше ячейки). Верх берётся и у соседних плиток: частица у края отдаёт вес граням соседа, и
+// сухой сосед должен очищать их каждый шаг (иначе вес копится, и доля воды там растёт без предела).
+// Считается до очистки граней: верх частиц известен из подсчёта прошлого шага (и загрузки проснувшихся).
+RWStructuredBuffer<int> W_TileTop;
+RWStructuredBuffer<int> W_TilePrevTop;
+RWStructuredBuffer<int2> W_TileRangeOut;
+StructuredBuffer<int> W_TileBed;
+static const int RangeMargin = 5;
+
+[numthreads(64, 1, 1)]
+void TileRange(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= W_TileCounts[W_ListSlot]) return;
+    uint t = ListTile(id.x);
+    int2 tc = W_TileCoord[t];
+    int top = -1;
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        int n = TileAtTile(tc + int2(dx, dz));
+        if (n >= 0) top = max(top, max(W_TileTop[n], W_TilePrevTop[n]));
+    }
+    W_TileRangeOut[t] = int2(W_TileBed[t], min(W_NY - 1, top + RangeMargin));
+}
+
+// После раскладки: верх этого шага становится прошлым, новый считает перенос.
+[numthreads(64, 1, 1)]
+void TileTopShift(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= W_TileCounts[W_ListSlot]) return;
+    uint t = ListTile(id.x);
+    W_TilePrevTop[t] = W_TileTop[t];
+    W_TileTop[t] = -1;
+}

@@ -1,0 +1,24 @@
+# Unreal generated
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+Saved_Refl/
+Build/
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
+
+# IDE / project files (regenerated)
+*.xcworkspace/
+*.xcodeproj/
+*.sln
+*.suo
+.vs/
+.vscode/
+.idea/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+*.blend1
+*.blend[0-9]

@@ -1,0 +1,118 @@
+#include "/Engine/Public/Platform.ush"
+// Видимость солнца для света под водой: тени дна, берега и тел (те же формы, что видит вода — W_Bed, W_Obstacles).
+// Прямой луч солнца в воде идёт по преломлённому направлению (Снеллиус), над водой — прямо на солнце. Сначала карта
+// над водой (2D, на уровне воды): луч к солнцу по рельефу и телам; потом объём в воде (3D вокруг глаза): луч по
+// преломлённому направлению до поверхности, там — значение карты. Тень мягкая по расстоянию до тела/дна: край тени
+// прямого луча — полутень солнечного диска (0.5°), растущая с длиной пути; дальше её размывает рассеянный свет
+// (его WaterRender считает отдельно, без тени).
+
+#include "/Plugin/SwampWater/Private/WaterCommon.ush"
+
+float3 W_ToSun;        // к солнцу, оси симуляции
+float3 W_SunInWater;   // куда идёт прямой луч в воде (вниз)
+float W_SunLevel;      // уровень воды, м
+float3 W_VisOrigin;    // угол объёма (x, низ, z), м
+float3 W_VisCell;      // размер ячейки объёма, м
+int3 W_VisSize;
+RWTexture2D<float> W_AirOut;
+Texture2D<float> W_AirIn;
+SamplerState W_AirSampler;
+RWTexture3D<float> W_VisOut;
+Texture2D<float> W_SunDepth;   // глубина сцены со стороны солнца, см (ортографический снимок)
+float3 W_SunDepthPos;          // камера снимка, м (оси симуляции)
+float3 W_SunDepthForward;
+float3 W_SunDepthRight;
+float3 W_SunDepthUp;
+float W_SunDepthWidth;         // м (0 — снимка нет)
+Texture3D<float> W_Sediment;   // ил, г/м³ (WaterSediment.usf)
+float3 W_SedimentOrigin;
+float3 W_SedimentExtent;       // м (0 — нет)
+float W_SedimentExtinction;    // м²/г: ослабление прямого луча илом (зелёный канал: a* + b*)
+
+static const float Penumbra = 0.03;      // м: полутень у самого тела
+static const float PenumbraGrowth = 0.009; // на метр пути: угловой размер солнца ~0.5°
+
+// Тень по пути: насколько близко луч подходит к телу или грунту — относительно полутени на этом расстоянии.
+float Occlusion(float3 q, float t)
+{
+    float3 n, v;
+    float body = NearestObstacle(q, n, v);
+    float ground = q.y - BedHeight(q.xz);
+    float pen = Penumbra + PenumbraGrowth * t;
+    return saturate(min(body, ground) / pen + 0.5);
+}
+
+// Над водой по снимку глубины со стороны солнца — тень от всего, что там есть (рельеф, тела, растения): точка
+// затенена, если снимок видит что-то ближе к солнцу. Мягко — 3×3 соседних текселя (полутень ~5 см).
+float SunDepthVisibility(float3 p)
+{
+    float3 rel = p - W_SunDepthPos;
+    float2 uv = float2(dot(rel, W_SunDepthRight), -dot(rel, W_SunDepthUp)) / W_SunDepthWidth + 0.5;
+    if (any(uv <= 0) || any(uv >= 1)) return 1.0;
+    float along = dot(rel, W_SunDepthForward);
+    uint w, h;
+    W_SunDepth.GetDimensions(w, h);
+    float lit = 0;
+    for (int y = -1; y <= 1; y++)
+    for (int x = -1; x <= 1; x++)
+    {
+        int2 t = clamp((int2)(uv * float2(w, h)) + int2(x, y), 0, int2(w, h) - 1);
+        float occluder = W_SunDepth.Load(int3(t, 0)) * 0.01;
+        lit += occluder > along - 0.06 ? 1.0 : 0.0; // 6 см: наклон грунта у кромки на тексель
+    }
+    return lit / 9.0;
+}
+
+// Над водой: от точки на уровне воды к солнцу. Есть снимок — по нему, нет — шагами по рельефу и телам воды.
+[numthreads(8, 8, 1)]
+void AirVisibility(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= W_VisSize.xz)) return;
+    float3 p = float3(W_VisOrigin.x + (id.x + 0.5) * W_VisCell.x, W_SunLevel, W_VisOrigin.z + (id.y + 0.5) * W_VisCell.z);
+    if (W_SunDepthWidth > 0 && W_ToSun.y > 0) { W_AirOut[id.xy] = SunDepthVisibility(p); return; }
+    float vis = 1.0;
+    if (W_ToSun.y <= 0) vis = 0;
+    float t = 0.05;
+    for (int i = 0; i < 40 && vis > 0; i++)
+    {
+        float3 q = p + W_ToSun * t;
+        if (q.y > W_GridOrigin.y + 60.0) break; // выше рельефа
+        vis = min(vis, Occlusion(q, t));
+        t += max(0.1, t * 0.12);
+    }
+    W_AirOut[id.xy] = vis;
+}
+
+// В воде: от точки к поверхности против прямого луча, потом — карта над водой в точке выхода.
+[numthreads(4, 4, 4)]
+void WaterVisibility(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int3)id >= W_VisSize)) return;
+    float3 p = W_VisOrigin + ((float3)id + 0.5) * W_VisCell;
+    float vis = 1.0;
+    float up = -W_SunInWater.y;
+    if (up <= 0) vis = 0;
+    else if (p.y < W_SunLevel)
+    {
+        float len = (W_SunLevel - p.y) / up;
+        const int Steps = 16;
+        float tau = 0; // оптическая толща облаков ила на пути луча
+        for (int i = 1; i <= Steps && vis > 0; i++)
+        {
+            float t = len * i / Steps;
+            float3 q = p - W_SunInWater * t;
+            vis = min(vis, Occlusion(q, t));
+            if (W_SedimentExtent.x > 0)
+            {
+                float3 uvw = (q - W_SedimentOrigin) / W_SedimentExtent;
+                if (all(uvw >= 0) && all(uvw <= 1)) tau += W_Sediment.SampleLevel(W_AirSampler, uvw, 0) * W_SedimentExtinction * len / Steps;
+            }
+        }
+        // Облако ила затеняет то, что под ним: прямой луч гаснет на его толще (рассеянный свет остаётся).
+        vis *= exp(-tau);
+        float3 e = p - W_SunInWater * len;
+        float2 uv = (e.xz - W_VisOrigin.xz) / (W_VisCell.xz * W_VisSize.xz);
+        vis *= all(uv >= 0) && all(uv <= 1) ? W_AirIn.SampleLevel(W_AirSampler, uv, 0) : 1.0;
+    }
+    W_VisOut[id] = vis;
+}

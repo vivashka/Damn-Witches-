@@ -1,0 +1,17 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Swamp Water",
+	"Description": "GPU APIC water simulation (port of the Unity DamnWitches water) with surface and whitewater rendering.",
+	"Category": "Rendering",
+	"CanContainContent": false,
+	"EnabledByDefault": true,
+	"Modules": [
+		{
+			"Name": "SwampWater",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}

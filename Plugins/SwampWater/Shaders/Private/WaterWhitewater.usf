@@ -1,0 +1,245 @@
+#include "/Engine/Public/Platform.ush"
+// Белая вода (Ihmsen et al. 2012): брызги, пена и пузыри — вторичные частицы поверх воды, на неё не влияют.
+// Рождаются из заявок переноса частиц воды (WaterParticles.compute, Whitewater), живут в пуле с местами: мёртвое
+// место (жизнь 0) — в стеке свободных. Двигаются раз за шаг воды (в его конце, W_StepDt): отрисовка ведёт их плавно
+// между двумя последними местами, как поверхность. Вид частицы — по месту относительно поверхности столбца, как у
+// Ihmsen по числу соседей-частиц воды:
+//  - выше поверхности больше чем на полъячейки — брызги: летят, только тяжесть; капля (радиус 0) исчезает, упав в
+//    воду, на дно или на тело (её вода — частица, которая летит рядом и при ударе сама захватывает воздух);
+//  - под водой — пузырь: течёт с водой и всплывает с конечной скоростью до поверхности;
+//  - у поверхности — пена (радиус со знаком минус): течёт с поверхностью, пузыри лопаются — жизнь убывает только у
+//    неё (WaterBubbles.hlsl).
+
+
+
+
+
+#define WATER_VEL_READONLY
+#include "/Plugin/SwampWater/Private/WaterCommon.ush"
+#include "/Plugin/SwampWater/Private/WaterBubbles.ush"
+
+Texture2D<float4> W_SurfaceIn;               // поверхность прошлого шага (WaterHeightField)
+RWStructuredBuffer<float4> W_White;          // по две float4: позиция + жизнь, скорость + радиус пузыря
+RWStructuredBuffer<uint> W_Free;             // свободные места
+RWStructuredBuffer<int> W_FreeCount;
+StructuredBuffer<float4> W_WhiteRequests;    // заявки переноса (тот же вид, что W_White)
+StructuredBuffer<uint> W_RequestCount;       // [1] — заявок (WaterParticles W_Stats)
+uint W_PoolSize;
+uint W_WhiteCapacity;
+float W_BubbleRise;
+
+static const float StrandDepth = 0.06;  // м: мельче — пена лежит на дне, трава и кочки берега прокалывают пузыри
+static const float StrandedDecay = 6.0; // во сколько раз быстрее лопается пена на мокром грунте
+
+// Пена и пузыри не проходят сквозь тела. Сетка размазывает скорость тела на ячейку вокруг (внутренние грани несут
+// скорость тела целиком), и пена у ноги ехала вместе с ногой. Вода без вязкости скользит вдоль тела: у тела берётся
+// скорость воды на ячейку дальше от него, и у неё отнимается только движение внутрь тела (по нормали — как у тела).
+float3 BodySlip(float3 x, float3 u)
+{
+    float3 n, bv;
+    float dist = NearestObstacle(x, n, bv);
+    if (dist >= W_Cell) return u;
+    float3 nh = float3(n.x, 0, n.z);
+    nh = dot(nh, nh) > 1e-6 ? normalize(nh) : float3(1, 0, 0);
+    float3 w = SampleGrid(x + nh * (W_Cell - max(dist, 0)));
+    float into = dot(w - bv, nh);
+    return into < 0 ? w - into * nh : w;
+}
+
+// Вытолкнуть из тела на свой радиус от него: пену — по горизонтали (она лежит на поверхности), пузырь под водой —
+// по кратчайшему пути наружу. По горизонтали пузырь под падающим телом (нормаль почти вертикальна) отлетал вбок на
+// весь радиус тела за шаг.
+float3 PushOut(float3 x, float r, bool horizontal)
+{
+    float3 n, bv;
+    float dist = NearestObstacle(x, n, bv);
+    if (dist >= r) return x;
+    if (!horizontal) return x + n * (r - dist);
+    float3 nh = float3(n.x, 0, n.z);
+    nh = dot(nh, nh) > 1e-6 ? normalize(nh) : float3(1, 0, 0);
+    return x + nh * (r - dist);
+}
+
+// Уровень воды в точке — билинейно между центрами столбцов, как его рисует сетка поверхности (WaterRender SimLevel).
+// Уровень своего столбца ступенькой отличался от нарисованного на сантиметры: пена то тонула, то висела над водой.
+float SurfaceLevel(float2 xz)
+{
+    float2 g = (xz - W_GridOrigin.xz) / W_Cell - 0.5;
+    int2 b = (int2)floor(g);
+    float2 f = g - b;
+    float s00 = W_SurfaceIn[clamp(b, 0, W_N - 1)].x, s10 = W_SurfaceIn[clamp(b + int2(1, 0), 0, W_N - 1)].x;
+    float s01 = W_SurfaceIn[clamp(b + int2(0, 1), 0, W_N - 1)].x, s11 = W_SurfaceIn[clamp(b + int2(1, 1), 0, W_N - 1)].x;
+    return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+}
+
+void Free(uint i)
+{
+    W_White[2 * i] = 0;
+    int at;
+    InterlockedAdd(W_FreeCount[0], 1, at);
+    W_Free[at] = i;
+}
+
+[numthreads(64, 1, 1)]
+void ResetPool(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= W_PoolSize) return;
+    W_White[2 * i] = 0;
+    W_White[2 * i + 1] = 0;
+    W_Free[i] = W_PoolSize - 1 - i;
+    if (i == 0) W_FreeCount[0] = (int)W_PoolSize;
+}
+
+// Пена (на поверхности) помечена знаком радиуса: b.w < 0. По одной глубине её не отличить от пузыря у поверхности:
+// пузырь в полосе у поверхности сразу ставился на неё (скачок до полъячейки за шаг), а пена, которую обогнала волна,
+// становилась пузырём. Пузырь всплывает до самой поверхности; пена держится на ней, пока волна не накроет её глубже
+// полъячейки.
+[numthreads(64, 1, 1)]
+void Update(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= W_PoolSize) return;
+    float4 a = W_White[2 * i];
+    if (a.w == 0) return;
+    float4 b = W_White[2 * i + 1];
+    float3 x = a.xyz, v = b.xyz;
+    const float3 x0 = x;
+    float life = a.w;
+    bool droplet = b.w == 0;
+    float r = abs(b.w);
+    bool surfaced = b.w < 0;
+    bool submerged = false;
+    float band = 0.5 * W_Cell;
+    int2 col = (int2)floor((x.xz - W_GridOrigin.xz) / W_Cell);
+    if (any(col < 0) || any(col >= W_N)) { Free(i); return; }
+    float4 s = W_SurfaceIn[col];
+    float bed = BedHeight(x.xz);
+    float level = s.y >= 0 ? SurfaceLevel(x.xz) : bed;
+    float d = s.y >= 0 ? x.y - level : 1e9;
+    if (droplet && d <= band) { Free(i); return; } // капля упала в воду
+    // Пена на мели и на суше: вода под ней тоньше StrandDepth (или ушла) — пятно садится на мокрый грунт, течение
+    // его больше не несёт, а пузыри лопаются быстро: плёнки стекают в грунт (StrandedDecay).
+    bool stranded = !droplet && x.y - bed < band && (s.y < StrandDepth || d > band);
+    if (stranded)
+    {
+        v = 0;
+        x.y = max(bed, level);
+        surfaced = false;
+        life -= W_StepDt * StrandedDecay;
+        if (life <= 0) { Free(i); return; }
+    }
+    else if (d > band)
+    {
+        v.y -= W_Gravity * W_StepDt;
+        x += v * W_StepDt;
+        surfaced = false;
+        if (x.y < bed) { Free(i); return; } // упала на сушу
+        float3 n, sv;
+        if (droplet && NearestObstacle(x, n, sv) < 0) { Free(i); return; } // на тело
+    }
+    else if (surfaced ? d >= -band : d >= 0)
+    {
+        float3 u = BodySlip(float3(x.x, level, x.z), SampleGrid(float3(x.x, level, x.z)));
+        v = float3(u.x, 0, u.z);
+        x += v * W_StepDt;
+        x.y = SurfaceLevel(x.xz);
+        surfaced = true;
+        life -= W_StepDt;
+        if (life <= 0) { Free(i); return; }
+    }
+    else
+    {
+        v = BodySlip(x, SampleGrid(x)) + float3(0, W_BubbleRise, 0);
+        x += v * W_StepDt;
+        x.y = max(x.y, BedHeight(x.xz));
+        // Дошёл до поверхности — всплыл: дальше пена.
+        float top = SurfaceLevel(x.xz);
+        surfaced = x.y >= top;
+        if (surfaced) x.y = top;
+        submerged = !surfaced;
+    }
+    if (!droplet)
+    {
+        x = PushOut(x, r, !submerged);
+        if (submerged) x.y = max(x.y, BedHeight(x.xz));
+        // Отрисовка ведёт частицу от прошлого места по скорости (WhiteVS): у пены и пузырей это весь сдвиг за шаг —
+        // вместе с выталкиванием из тела, поверхностью и дном. Иначе на стыке шагов частица перескакивала. (Их
+        // скорость каждый шаг берётся заново из сетки; у брызг сдвиг и есть скорость.)
+        v = (x - x0) / W_StepDt;
+    }
+    W_White[2 * i] = float4(x, life);
+    W_White[2 * i + 1] = float4(v, droplet ? 0 : (surfaced ? -r : r));
+}
+
+// Заявка — в свободное место пула. Оторвавшаяся частица воды (литр, жизнь < 0) рвётся на DropletsPerDrop капель
+// (радиус 0 — капля, жизнь у неё не убывает) вокруг себя: шар в ячейку выглядел бы мячом.
+static const uint DropletsPerDrop = 6;
+static const float DropletsExtra = 6.0;       // сверх того — для быстрых частиц (по одной на м/с свыше 2)
+static const float DropletSpread = 0.35;      // доля скорости частицы — разброс скорости капель
+static const float DropletSpreadRest = 0.4;   // м/с — разброс и у медленных
+
+bool Place(float4 a, float4 b)
+{
+    int at;
+    InterlockedAdd(W_FreeCount[0], -1, at);
+    if (at <= 0) { InterlockedAdd(W_FreeCount[0], 1); return false; } // пул полон
+    uint slot = W_Free[at - 1];
+    W_White[2 * slot] = a;
+    W_White[2 * slot + 1] = b;
+    return true;
+}
+
+[numthreads(64, 1, 1)]
+void Emit(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= min(W_RequestCount[1], W_WhiteCapacity)) return;
+    float4 a = W_WhiteRequests[2 * i], b = W_WhiteRequests[2 * i + 1];
+    if (a.w >= 0) { Place(a, b); return; }
+    uint h = Hash(asuint(a.x) ^ Hash(asuint(a.z) ^ i));
+    // Капли одной частицы разлетаются: у каждой свой разброс скорости — случайное направление, величиной в долю
+    // скорости частицы (плюс немного от покоя). С одной скоростью на всех они шли бы сплошным столбом. Быстрая
+    // частица — сильный удар — рвётся на больше капель.
+    float speed = length(b.xyz);
+    uint count = DropletsPerDrop + (uint)clamp(speed - 2.0, 0.0, DropletsExtra);
+    float spread = DropletSpread * speed + DropletSpreadRest;
+    for (uint k = 0; k < count; k++)
+    {
+        h = Hash(h);
+        float3 r = float3(h & 1023u, (h >> 10) & 1023u, (h >> 20) & 1023u) / 1023.0 - 0.5;
+        h = Hash(h);
+        float3 u = float3(h & 1023u, (h >> 10) & 1023u, (h >> 20) & 1023u) / 1023.0 * 2.0 - 1.0;
+        u.y = abs(u.y) * 0.7 + 0.15; // брызги идут вверх и в стороны, а не в воду
+        if (!Place(float4(a.xyz + r * 0.5 * W_Cell, 1), float4(b.xyz + u * spread, 0))) return;
+    }
+}
+
+// Воздух, захваченный телами при входе в воду (WaterBodyForces): источник — кусочек тела у ватерлинии, пузыри — на его
+// глубине (оттуда всплывают), в
+// его пятне, по глубине шлейфа (PlumeDepth). По две float4: место у поверхности + полуширина пятна, скорость (y —
+// глубина шлейфа) + число пузырей.
+StructuredBuffer<float4> W_Sources;
+uint W_SourceCount;
+
+[numthreads(64, 1, 1)]
+void EmitSources(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= W_SourceCount) return;
+    float4 a = W_Sources[2 * i], b = W_Sources[2 * i + 1];
+    uint h = Hash(i * 7919u ^ asuint(a.x) ^ Hash(asuint(a.z)));
+    uint count = (uint)b.w + ((h & 0xFFFFu) < (uint)(frac(b.w) * 65536.0) ? 1u : 0u);
+    for (uint k = 0; k < min(count, 512u); k++)
+    {
+        h = Hash(h);
+        float2 r = float2(h & 0xFFFFu, h >> 16) / 65535.0 * 2.0 - 1.0;
+        h = Hash(h);
+        float radius = BubbleRadius((h & 0xFFFFu) / 65536.0);
+        float life = BubbleLife(radius, ((h >> 16) + 1u) / 65536.0);
+        h = Hash(h);
+        float3 pos = a.xyz + float3(r.x * a.w, -b.y * (h & 0xFFFFu) / 65536.0, r.y * a.w);
+        pos.y = max(pos.y, BedHeight(pos.xz) + 0.01);
+        if (!Place(float4(pos, life), float4(b.x, 0, b.z, radius))) return;
+    }
+}

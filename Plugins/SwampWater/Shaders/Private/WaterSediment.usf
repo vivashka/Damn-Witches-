@@ -1,0 +1,74 @@
+#include "/Engine/Public/Platform.ush"
+// Ил со дна: взвесь (г/м³ = мг/л) в объёме вокруг глаза. Поднимается с дна, где касательное напряжение течения
+// τ = ρ·u*² больше критического (размыв Партениадеса: E = M·(τ/τc − 1)), и где тело трогает дно; несётся течением
+// воды (обратный перенос по скорости сетки) и оседает со скоростью хлопьев. Оптику взвеси учитывает WaterRender.
+
+#define WATER_VEL_READONLY
+#include "/Plugin/SwampWater/Private/WaterCommon.ush"
+
+Texture3D<float> W_SedPrev;
+SamplerState W_SedSampler;
+RWTexture3D<float> W_SedOut;
+float3 W_SedOrigin;      // м, угол объёма этого кадра
+float3 W_SedPrevOrigin;  // прошлого кадра (объём ездит за глазом)
+float3 W_SedCell;
+int3 W_SedSize;
+float W_SedDt;
+float W_SedLevel;
+int W_SedHasPrev;
+int W_SedDebug;          // отладка: вместо ила — скорость воды у дна, мм/с
+int W_SedErode;          // 0 — вода ещё устанавливается после сброса (её течения — не течения пруда)
+
+// Мягкий органический ил болот: рыхлый верхний слой («fluff») τc ≈ 0.02–0.05 Па (залив Фос; гавань Балтимора —
+// ~0.05 Па с ним, ~0.1 без него), берём 0.03 Па (u*c ≈ 5.5 мм/с); M ≈ 0.5 г/(м²·с) (Partheniades 1965; Winterwerp & van
+// Kesteren 2004 — 1e-4…1e-3 кг/(м²·с) для мягких илов); пресноводные хлопья 30–90 мкм оседают 0.1…1 мм/с (замеры
+// в дельте Wax Lake), берём середину.
+static const float CriticalUStar = 0.0055; // м/с: √(τc/ρ)
+static const float ErosionRate = 0.5;     // г/(м²·с)
+static const float SettlingSpeed = 0.0005; // м/с
+static const float ContactRate = 40.0;    // г/(м²·с) на 1 м/с скорости тела у дна: копыто, нога, шар взбивают ил
+static const float Karman = 0.41;
+// Ложные течения симуляции у дна: в стоячем пруду она даёт 5–10 см/с (сетка 20 см, решатель давления; замер —
+// swampwater.SedimentDebug). Размывают только течения сильнее этого шума — струи удара, волна, тело.
+static const float VelocityNoise = 0.12;  // м/с
+static const float BedRoughness = 0.001;  // м: z0 гладкого ила
+
+[numthreads(4, 4, 4)]
+void SedimentUpdate(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int3)id >= W_SedSize)) return;
+    float3 p = W_SedOrigin + ((float3)id + 0.5) * W_SedCell;
+    float bed = BedHeight(p.xz);
+    if (p.y > W_SedLevel || p.y < bed - W_SedCell.y) { W_SedOut[id] = 0; return; }
+
+    // Перенос: откуда сюда пришла вода за кадр (течение) и что осело сверху.
+    float3 u = SampleGrid(p);
+    float3 from = p - u * W_SedDt + float3(0, SettlingSpeed * W_SedDt, 0);
+    float c = 0;
+    if (W_SedHasPrev > 0)
+    {
+        float3 uvw = (from - W_SedPrevOrigin) / (W_SedCell * W_SedSize);
+        if (all(uvw >= 0) && all(uvw <= 1)) c = W_SedPrev.SampleLevel(W_SedSampler, uvw, 0);
+    }
+
+    // Размыв дна — в нижний слой над ним.
+    float above = p.y - bed;
+    if (above >= 0 && above < W_SedCell.y)
+    {
+        // Скорость — в самой воде, на полторы ячейки над дном (в первой ячейке — скорость, продолженная симуляцией
+        // внутрь грунта, она не течение); к дну — по логарифмическому профилю: u* = κ·u(z)/ln(z/z0).
+        // На мели — не выше половины глубины: над водой скорость сетки — продолжение в воздух.
+        float zRef = clamp(0.5 * (W_SedLevel - bed), 0.05, 1.5 * W_Cell);
+        float3 near = SampleGrid(float3(p.x, bed + zRef, p.z));
+        float ustar = Karman * max(length(near) - VelocityNoise, 0) / log(zRef / BedRoughness);
+        if (W_SedDebug > 0) { W_SedOut[id] = length(near) * 1000.0; return; }
+        float excess = max(ustar * ustar / (CriticalUStar * CriticalUStar) - 1.0, 0);
+        float flux = W_SedErode > 0 ? ErosionRate * excess : 0;
+        // Тело у дна: ил взбивает само движение (сетка его не видит — тело мельче ячейки).
+        float3 n, bv;
+        float d = NearestObstacle(float3(p.x, bed + 0.02, p.z), n, bv);
+        if (d < 0.05) flux += ContactRate * length(bv) * saturate(1.0 - d / 0.05);
+        c += flux * W_SedDt / W_SedCell.y;
+    }
+    W_SedOut[id] = min(c, 500.0); // 500 мг/л — густая взвесь
+}

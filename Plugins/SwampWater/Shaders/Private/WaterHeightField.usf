@@ -1,0 +1,217 @@
+#include "/Engine/Public/Platform.ush"
+// Поверхность воды по столбцам для тел и отрисовки: (уровень, глубина или −1 — сухо, скорость x, z).
+// Пересчитываются только столбцы считаемых плиток и каймы (группа 8×8 на плитку): у спящих ничего не меняется,
+// а сглаживание и заполнение дотягиваются не дальше трёх столбцов — это внутри каймы.
+
+
+
+
+
+#include "/Plugin/SwampWater/Private/WaterCommon.ush"
+
+RWTexture2D<float4> W_SurfaceOut;
+Texture2D<float4> W_SurfaceIn;
+int2 W_BlurStep;                      // (1, 0) или (0, 1)
+
+
+float CellFraction(int i) { return i < 0 ? 0 : W_Density[i]; }
+
+// Столбец группы: плитка из списка, поток — столбец в ней. false — за концом списка.
+// W_AllTiles — все места плиток карты (при сбросе). W_Spread — ещё и соседние места без плиток (суша у берега:
+// её уровень берётся у воды рядом).
+int W_AllTiles;
+int W_Spread;
+float W_InitLevel;                    // стартовый уровень: поверхность спящих при сбросе плиток
+Texture2D<float4> W_SurfaceKeep;      // поверхность до этого шага
+StructuredBuffer<int> W_SimIndex;
+
+// Столбец каймы (плитка не считается): её частицы отложены, сбор плотности её ячеек не заполняет — поверхность
+// остаётся той, что была, пока плитка считалась (или стартовой), иначе на краю зоны счёта вода «пропадает».
+bool KeepColumn(int2 c)
+{
+    if (W_AllTiles != 0) return false;
+    int t = W_TileMap[(c.y >> 3) * W_NT + (c.x >> 3)];
+    return t >= 0 && W_SimIndex[t] < 0;
+}
+
+bool TileColumn(uint3 group, uint3 thread, out int2 c)
+{
+    c = 0;
+    int2 tc;
+    if (W_AllTiles != 0)
+    {
+        if (group.x >= (uint)(W_NT * W_NT)) return false;
+        tc = int2(group.x % (uint)W_NT, group.x / (uint)W_NT);
+    }
+    else
+    {
+        uint si = W_Spread != 0 ? group.x / 9u : group.x;
+        if (si >= W_TileCounts[W_ListSlot]) return false;
+        tc = W_TileCoord[ListTile(si)];
+        uint o = group.x % 9u;
+        if (W_Spread != 0 && o != 4u)
+        {
+            tc += int2((int)(o % 3u) - 1, (int)(o / 3u) - 1);
+            if (any(tc < 0) || any(tc >= W_NT) || W_TileMap[tc.y * W_NT + tc.x] >= 0) return false;
+        }
+    }
+    c = tc * 8 + (int2)thread.xy;
+    return true;
+}
+
+// Уровень столбца — та же поверхность, что видит давление (ghost fluid, FluidFraction): над верхней ячейкой-водой
+// (заполнена хотя бы наполовину) на θ ячейки. Где воды меньше полуячейки (мель у берега) — дно плюс объём: при
+// заполнении нижней ячейки ровно наполовину оба дают её середину, переход непрерывен. Скорость — средняя по воде
+// горизонтальная. false — в столбце нет воды.
+bool ColumnSurface(int i, int k, out float level, out float2 velocity, out float bottom)
+{
+    level = 0;
+    velocity = 0;
+    bottom = max(BedLoad(int2(i, k)), W_GridOrigin.y);
+    int col = ColumnBase(i, k);
+    if (col < 0) return false;
+    float water = 0;
+    float2 momentum = 0;
+    for (int y = 0; y < W_NY; y++)
+    {
+        int3 c = int3(i, y, k);
+        float fraction = CellFraction(col + y * TileColumns);
+        if (fraction <= 0) continue;
+        float2 vel = 0.5 * float2(FaceVel(0, c) + FaceVel(0, c + int3(1, 0, 0)), FaceVel(2, c) + FaceVel(2, c + int3(0, 0, 1)));
+        water += fraction;
+        momentum += fraction * vel;
+    }
+    if (water * W_Cell <= 1e-3) return false;
+    velocity = momentum / water;
+    level = bottom + water * W_Cell;
+    for (int t = W_NY - 2; t >= 0; t--)
+    {
+        if (Fill(col + t * TileColumns) < 0.5) continue;
+        level = max(bottom + 1e-3, W_GridOrigin.y + (t + 0.5 + FluidFraction(int3(i, t, k), int3(i, t + 1, k))) * W_Cell);
+        break;
+    }
+    return true;
+}
+
+// Над водой столбца (в пределах ячейки) или у самого уровня — тело: свободной поверхности здесь нет (вода под
+// плавающим кубом, у ноги), уровень столбца — лишь низ тела.
+bool Covered(int i, int k, float level)
+{
+    if (!BodyNear(i, k)) return false;
+    float2 xz = float2(W_GridOrigin.x + (i + 0.5) * W_Cell, W_GridOrigin.z + (k + 0.5) * W_Cell);
+    float3 n, v;
+    return NearestObstacle(float3(xz.x, level + 0.5 * W_Cell, xz.y), n, v) < 0
+        || NearestObstacle(float3(xz.x, level, xz.y), n, v) < 0;
+}
+
+// Под телом (кубом, ногой) свободной поверхности нет: столбцу даётся уровень и течение окружающей воды — по
+// ближайшему кольцу столбцов, где поверхность открыта. Это и нужно силам на тело (давление вокруг задаёт уровень
+// окружающей воды, Архимед и сопротивление считаются относительно неё), а под телом поверхность всё равно не видна.
+static const int CoverReach = 8; // столбцов (1.6 м) — тело шире пока не плавает
+
+[numthreads(8, 8, 1)]
+void BuildSurface(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID)
+{
+    int2 id;
+    if (!TileColumn(group, thread, id)) return;
+    if (KeepColumn(id)) { W_SurfaceOut[id.xy] = W_SurfaceKeep[id.xy]; return; }
+    int i = id.x, k = id.y;
+    float level, bottom;
+    float2 vel;
+    float bed = BedLoad(int2(i, k));
+    if (!ColumnSurface(i, k, level, vel, bottom))
+    {
+        // При сбросе плитки вне радиуса симуляции сразу засыпают, и сбор их ячеек не заполняет: их вода стоит
+        // в покое на стартовом уровне — поверхность по нему, иначе её не видно, пока плитка не проснётся.
+        if (W_AllTiles != 0 && ColumnBase(i, k) >= 0 && bottom < W_InitLevel - 1e-3)
+        {
+            W_SurfaceOut[id.xy] = float4(W_InitLevel, W_InitLevel - bottom, 0, 0);
+            return;
+        }
+        W_SurfaceOut[id.xy] = float4(bed - 0.25, -1, 0, 0);
+        return;
+    }
+    if (Covered(i, k, level))
+    {
+        // Кольцо вплотную к телу пропускается: вода у самого борта ходит вместе с телом (сетка размазывает тело до
+        // ячейки), и Архимед по её уровню отставал от качки и раскачивал плавающий куб без конца.
+        bool skipped = false;
+        for (int r = 1; r <= CoverReach; r++)
+        {
+            float sum = 0;
+            float2 flow = 0;
+            int count = 0;
+            for (int dz = -r; dz <= r; dz++)
+            for (int dx = -r; dx <= r; dx++)
+            {
+                if (max(abs(dx), abs(dz)) != r) continue;
+                int2 n = int2(i + dx, k + dz);
+                if (any(n < 0) || any(n >= W_N)) continue;
+                float nl, nb;
+                float2 nv;
+                if (!ColumnSurface(n.x, n.y, nl, nv, nb) || Covered(n.x, n.y, nl)) continue;
+                sum += nl;
+                flow += nv;
+                count++;
+            }
+            if (count == 0) continue;
+            if (!skipped && r < CoverReach) { skipped = true; continue; }
+            level = max(sum / count, bottom + 1e-3);
+            vel = flow / count;
+            break;
+        }
+    }
+    W_SurfaceOut[id.xy] = float4(level, level - bottom, vel);
+}
+
+// Частица добавляет столбцу (ячейка/8) высоты, и уровень по столбцам шумит на эту величину. Волну короче
+// ~4 ячеек сетка всё равно не держит, поэтому уровень сглаживается фильтром [1 2 1]/4 (по мокрым соседям).
+[numthreads(8, 8, 1)]
+void BlurSurface(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID)
+{
+    int2 c;
+    if (!TileColumn(group, thread, c)) return;
+    float4 s = W_SurfaceIn[c];
+    if (s.y < 0 || KeepColumn(c)) { W_SurfaceOut[c] = s; return; }
+    float sum = 2 * s.x, weight = 2;
+    for (int k = -1; k <= 1; k += 2)
+    {
+        int2 n = c + k * W_BlurStep;
+        if (any(n < 0) || any(n >= W_N)) continue;
+        float4 o = W_SurfaceIn[n];
+        if (o.y < 0) continue;
+        sum += o.x;
+        weight += 1;
+    }
+    float eta = sum / weight;
+    W_SurfaceOut[c] = float4(eta, max(s.y + eta - s.x, 1e-4), s.zw);
+}
+
+// У сухого столбца рядом с водой уровень — как у соседа (чтобы кромка сетки поверхности не падала к дну).
+[numthreads(8, 8, 1)]
+void FillSurface(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID)
+{
+    int2 c;
+    if (!TileColumn(group, thread, c)) return;
+    float4 s = W_SurfaceIn[c];
+    if (s.y >= 0 || KeepColumn(c)) { W_SurfaceOut[c] = s; return; }
+    float eta = -1e9;
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        float4 n = W_SurfaceIn[clamp(c + int2(dx, dy), 0, W_N - 1)];
+        if (n.y >= 0) eta = max(eta, n.x);
+    }
+    W_SurfaceOut[c] = eta > -1e8 ? float4(eta, 0, 0, 0) : s;
+}
+
+
+// Копия поверхности в буфер — для чтения на CPU (буфер читается без остановки GPU, текстура на Metal — нет).
+RWStructuredBuffer<float4> W_SurfaceBuf;
+
+[numthreads(8, 8, 1)]
+void CopySurface(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= (uint)W_N)) return;
+    W_SurfaceBuf[id.y * (uint)W_N + id.x] = W_SurfaceIn[id.xy];
+}
